@@ -176,3 +176,13 @@ of the existing poll loop / SQLite store**; don't rearchitect to add them.
   need, then iterate. "Avoid complexity" here specifically means **don't couple
   the app to T-Mobile's schema** — not "avoid features."
 - Preserve the `poll_gateway()` boundary and `raw_json` capture in every change.
+
+## Commit messages
+
+Use [Conventional Commits](https://www.conventionalcommits.org/):
+`<type>(<optional scope>): <description>`, imperative mood, no trailing period.
+
+Common types here: `feat`, `fix`, `docs`, `refactor`, `chore`. Add a body when
+the *why* isn't obvious from the diff (e.g. a firmware quirk being worked
+around). Breaking changes get a `!` after the type/scope (e.g. `feat!:`) plus
+a `BREAKING CHANGE:` footer.
