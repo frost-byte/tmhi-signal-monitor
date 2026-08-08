@@ -54,7 +54,7 @@ GET http://192.168.12.1/TMI/v1/gateway?get=signal
 - **No authentication** required for `get=signal` on this gateway/firmware.
 - Returns JSON. Confirmed live against the actual G4AR on 2025 firmware.
 
-### Real sample response (captured from the live gateway)
+### Real sample response (captured from a live gateway, `cid`/`gNBID` anonymized)
 
 ```json
 {
@@ -63,8 +63,8 @@ GET http://192.168.12.1/TMI/v1/gateway?get=signal
       "antennaUsed": "External",
       "bands": ["n71"],
       "bars": 4.0,
-      "cid": 302,
-      "gNBID": 1083128,
+      "cid": 12345,
+      "gNBID": 999999,
       "rsrp": -96,
       "rsrq": -14,
       "rssi": -81,
@@ -79,6 +79,12 @@ GET http://192.168.12.1/TMI/v1/gateway?get=signal
   }
 }
 ```
+
+`cid`/`gNBID` above are placeholders, not the real captured values — those two
+fields plus CellMapper are enough to identify which physical tower a specific
+gateway connects to, so don't paste real ones back in here. Everything else
+in the sample (signal levels, band, antenna, registration) is real captured
+shape/units, just not identifying on its own.
 
 Notes on that capture: it was taken during a site survey with the **external
 directional panel antenna temporarily indoors**, so the values (esp. `sinr: 0`)
