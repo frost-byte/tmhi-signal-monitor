@@ -94,7 +94,7 @@ x86_64.) If you'd rather not run speed tests at all, turn them off from the
 
 ## The dashboard
 
-Three tabs, no page reloads:
+Four tabs, no page reloads:
 
 - **Signal** — live SINR / RSRP / RSRQ / RSSI / band / bars / antenna /
   connection state, plus a scrolling history chart. Every readout has a
@@ -107,6 +107,11 @@ Three tabs, no page reloads:
   updating in real time, not just the final result. If speed testing is
   turned off, or the CLI binary isn't installed, this tab explains why and
   how to fix it instead of showing empty charts.
+- **Details** — gateway model, manufacturer, hardware/firmware version,
+  update status, uptime, serial, and MAC address; plus cellular network
+  details that aren't signal-strength metrics (APN, roaming, IPv6 support,
+  band, registration state, cell ID, gNodeB ID). Uptime resetting to a small
+  number is a good sign the gateway just rebooted.
 - **Configuration** — every setting below, editable from the browser. Most
   changes apply on the next poll/test cycle with no restart; a couple
   (listening address/port) are flagged as needing one.
@@ -125,6 +130,7 @@ permanent.
 | Gateway URL | `--gateway-url` | `http://192.168.12.1/TMI/v1/gateway?get=signal` |
 | Signal poll interval | `--poll-seconds` | `5` |
 | Gateway fetch timeout | `--fetch-timeout` | `8` |
+| Device info poll interval | `--device-poll-interval` | `300` (5 min) |
 | Dashboard listen host | `--http-host` | `0.0.0.0` (all interfaces) |
 | Dashboard listen port | `--http-port` | `8073` |
 | Enable speed testing | `--speedtest-enabled` | `true` |

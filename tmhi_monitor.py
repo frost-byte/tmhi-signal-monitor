@@ -31,6 +31,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -65,6 +66,14 @@ CONFIG_SCHEMA = {
         "help": "How long to wait for the gateway to respond before giving up on a poll.",
         "restart_required": False,
         "validate": lambda v: v >= 1,
+    },
+    "device_poll_interval": {
+        "type": "int", "default": 300, "unit": "s",
+        "label": "Device Info Poll Interval",
+        "help": "How often to check gateway model/firmware/uptime (via ?get=all). These rarely "
+                "change, so this can be much less frequent than the signal poll.",
+        "restart_required": False,
+        "validate": lambda v: v >= 30,
     },
     "http_host": {
         "type": "str", "default": "0.0.0.0",
@@ -138,6 +147,14 @@ def db_connect(db_path):
 
 _db_lock = threading.Lock()
 
+def _ensure_columns(conn, table, columns):
+    """Add columns to an existing table if missing -- lets older DBs pick up
+    new fields without wiping history. columns: {name: SQL type}."""
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, coltype in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {coltype}")
+
 def db_init(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signal_history (
@@ -159,6 +176,33 @@ def db_init(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON signal_history(ts)")
+    # Added later: non-signal-strength cellular details from the same poll,
+    # shown in the Details tab. ALTER, not a fresh CREATE, so existing DBs
+    # don't lose history.
+    _ensure_columns(conn, "signal_history", {
+        "apn": "TEXT", "roaming": "INTEGER", "has_ipv6": "INTEGER",
+    })
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS device_history (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                REAL NOT NULL,
+            iso               TEXT NOT NULL,
+            ok                INTEGER NOT NULL,   -- 1 = gateway answered, 0 = fetch/parse failed
+            manufacturer      TEXT,
+            model             TEXT,
+            hardware_version  TEXT,
+            software_version  TEXT,               -- firmware
+            serial            TEXT,
+            mac_id            TEXT,
+            update_state      TEXT,                -- e.g. "latest"
+            uptime_seconds    REAL,
+            local_time        REAL,
+            timezone          TEXT,
+            raw_json          TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_device_ts ON device_history(ts)")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS speedtest_history (
@@ -191,20 +235,54 @@ def db_insert(conn, row):
     with _db_lock:
         conn.execute("""
             INSERT INTO signal_history
-              (ts, iso, ok, connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid, raw_json)
+              (ts, iso, ok, connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid,
+               apn, roaming, has_ipv6, raw_json)
             VALUES
-              (:ts, :iso, :ok, :connection, :antenna, :band, :bars, :rsrp, :rsrq, :sinr, :rssi, :cid, :gnbid, :raw_json)
+              (:ts, :iso, :ok, :connection, :antenna, :band, :bars, :rsrp, :rsrq, :sinr, :rssi, :cid, :gnbid,
+               :apn, :roaming, :has_ipv6, :raw_json)
         """, row)
         conn.commit()
 
 def db_rows_since(conn, since_ts):
     with _db_lock:
+        # DESC+LIMIT then reverse, not ASC+LIMIT: with since=0 (initial page
+        # load) on a DB with >5000 rows, ASC+LIMIT silently returns the
+        # OLDEST 5000 instead of anything recent. Incremental since=<lastTs>
+        # calls only ever match a handful of rows, so this doesn't change
+        # their behavior.
         cur = conn.execute(
-            "SELECT ts, iso, ok, connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid "
-            "FROM signal_history WHERE ts > ? ORDER BY ts ASC LIMIT 5000",
+            "SELECT ts, iso, ok, connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid, "
+            "apn, roaming, has_ipv6 "
+            "FROM signal_history WHERE ts > ? ORDER BY ts DESC LIMIT 5000",
             (since_ts,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        rows.reverse()
+        return rows
+
+def db_insert_device(conn, row):
+    with _db_lock:
+        conn.execute("""
+            INSERT INTO device_history
+              (ts, iso, ok, manufacturer, model, hardware_version, software_version,
+               serial, mac_id, update_state, uptime_seconds, local_time, timezone, raw_json)
+            VALUES
+              (:ts, :iso, :ok, :manufacturer, :model, :hardware_version, :software_version,
+               :serial, :mac_id, :update_state, :uptime_seconds, :local_time, :timezone, :raw_json)
+        """, row)
+        conn.commit()
+
+def db_device_rows_since(conn, since_ts):
+    with _db_lock:
+        cur = conn.execute(
+            "SELECT ts, iso, ok, manufacturer, model, hardware_version, software_version, "
+            "serial, mac_id, update_state, uptime_seconds, local_time, timezone "
+            "FROM device_history WHERE ts > ? ORDER BY ts DESC LIMIT 5000",
+            (since_ts,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        rows.reverse()
+        return rows
 
 def db_insert_speed(conn, row):
     with _db_lock:
@@ -223,10 +301,12 @@ def db_speed_rows_since(conn, since_ts):
         cur = conn.execute(
             "SELECT ts, iso, ok, download_mbps, upload_mbps, ping_ms, jitter_ms, packet_loss, "
             "server_name, server_location, isp "
-            "FROM speedtest_history WHERE ts > ? ORDER BY ts ASC LIMIT 5000",
+            "FROM speedtest_history WHERE ts > ? ORDER BY ts DESC LIMIT 5000",
             (since_ts,),
         )
-        return [dict(r) for r in cur.fetchall()]
+        rows = [dict(r) for r in cur.fetchall()]
+        rows.reverse()
+        return rows
 
 def db_config_load(conn):
     with _db_lock:
@@ -322,7 +402,9 @@ def poll_gateway():
         "ts": now, "iso": iso, "ok": 0,
         "connection": None, "antenna": None, "band": None, "bars": None,
         "rsrp": None, "rsrq": None, "sinr": None, "rssi": None,
-        "cid": None, "gnbid": None, "raw_json": None,
+        "cid": None, "gnbid": None,
+        "apn": None, "roaming": None, "has_ipv6": None,
+        "raw_json": None,
     }
 
     try:
@@ -366,6 +448,9 @@ def poll_gateway():
         "rssi": primary.get("rssi"),
         "cid": primary.get("cid"),
         "gnbid": primary.get("gNBID"),
+        "apn": generic.get("apn"),
+        "roaming": generic.get("roaming"),
+        "has_ipv6": generic.get("hasIPv6"),
     })
     return base
 
@@ -384,6 +469,73 @@ def poller_loop(conn, stop_event):
         except Exception as e:
             print(f"[poller] insert failed: {e}")
         stop_event.wait(CFG.get("poll_seconds"))
+
+# ----------------------------------------------------------------------------
+# DEVICE INFO  -  same fragile-boundary rule as poll_gateway(): if T-Mobile
+# renames/re-nests device or time fields, fix it HERE. Uses ?get=all (rather
+# than a separate config URL) so it tracks gateway_url if that's ever changed,
+# just swapping the query string.
+# ----------------------------------------------------------------------------
+def _device_info_url():
+    parts = urlsplit(CFG.get("gateway_url"))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "get=all", ""))
+
+def poll_device():
+    now = time.time()
+    iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    base = {
+        "ts": now, "iso": iso, "ok": 0,
+        "manufacturer": None, "model": None, "hardware_version": None, "software_version": None,
+        "serial": None, "mac_id": None, "update_state": None,
+        "uptime_seconds": None, "local_time": None, "timezone": None,
+        "raw_json": None,
+    }
+
+    try:
+        req = urllib.request.Request(_device_info_url(), headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=CFG.get("fetch_timeout")) as resp:
+            raw_text = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        base["raw_json"] = json.dumps({"_fetch_error": str(e)})
+        return base
+
+    base["raw_json"] = raw_text
+
+    try:
+        data = json.loads(raw_text)
+    except Exception as e:
+        base["raw_json"] = json.dumps({"_parse_error": str(e), "_body": raw_text[:2000]})
+        return base
+
+    device = _dig(data, "device", default={}) or {}
+    t      = _dig(data, "time", default={}) or {}
+
+    base.update({
+        "ok": 1,
+        "manufacturer": device.get("manufacturer"),
+        "model": device.get("model"),
+        "hardware_version": device.get("hardwareVersion"),
+        "software_version": device.get("softwareVersion"),
+        "serial": device.get("serial"),
+        "mac_id": device.get("macId"),
+        "update_state": device.get("updateState"),
+        "uptime_seconds": t.get("upTime"),
+        "local_time": t.get("localTime"),
+        "timezone": t.get("localTimeZone"),
+    })
+    return base
+
+def device_loop(conn, stop_event):
+    while not stop_event.is_set():
+        reading = poll_device()
+        try:
+            db_insert_device(conn, reading)
+            status = "ok" if reading["ok"] else "NO DATA"
+            print(f"[{reading['iso']}] device {status}  "
+                  f"fw={reading['software_version']}  uptime={reading['uptime_seconds']}")
+        except Exception as e:
+            print(f"[device] insert failed: {e}")
+        stop_event.wait(CFG.get("device_poll_interval"))
 
 # ----------------------------------------------------------------------------
 # SPEED TEST  -  the only Ookla-CLI-schema-aware code in the app. Same rule as
@@ -597,6 +749,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .config-input{width:100%;max-width:420px;background:var(--ink);border:1px solid var(--line);
     border-radius:6px;color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 10px}
   .config-input:focus{outline:none;border-color:var(--cyan)}
+  .kv-section-title{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);
+    border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:4px}
+  .kv-row{display:flex;justify-content:space-between;gap:16px;padding:8px 0;
+    border-bottom:1px solid var(--line);font-size:13px}
+  .kv-row:last-of-type{border-bottom:none}
+  .kv-label{color:var(--dim)}
+  .kv-val{color:var(--text);font-variant-numeric:tabular-nums;text-align:right}
   .notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;
     padding:16px 18px;margin-bottom:20px}
   .notice.hidden{display:none}
@@ -675,6 +834,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="tabs">
     <button class="tab-btn active" data-tab="signal">Signal</button>
     <button class="tab-btn" data-tab="speed">Connection</button>
+    <button class="tab-btn" data-tab="details">Details</button>
     <button class="tab-btn" data-tab="config">Configuration</button>
   </div>
 
@@ -780,6 +940,31 @@ chmod +x ~/.local/bin/speedtest</pre>
         </div>
         <div class="chart-wrap"><canvas id="chart-speed"></canvas></div>
       </div>
+    </div>
+  </section>
+
+  <section class="tab-panel hidden" id="panel-details">
+    <div class="chartbox" style="max-width:640px">
+      <div class="kv-section-title">Device</div>
+      <div class="kv-row"><span class="kv-label">Model</span><span class="kv-val" id="dev-model">–</span></div>
+      <div class="kv-row"><span class="kv-label">Manufacturer</span><span class="kv-val" id="dev-manufacturer">–</span></div>
+      <div class="kv-row"><span class="kv-label">Hardware Version</span><span class="kv-val" id="dev-hw">–</span></div>
+      <div class="kv-row"><span class="kv-label">Firmware Version</span><span class="kv-val" id="dev-fw">–</span></div>
+      <div class="kv-row"><span class="kv-label">Update State</span><span class="kv-val" id="dev-update-state">–</span></div>
+      <div class="kv-row"><span class="kv-label">Uptime</span><span class="kv-val" id="dev-uptime">–</span></div>
+      <div class="kv-row"><span class="kv-label">Serial Number</span><span class="kv-val" id="dev-serial">–</span></div>
+      <div class="kv-row"><span class="kv-label">MAC Address</span><span class="kv-val" id="dev-mac">–</span></div>
+
+      <div class="kv-section-title" style="margin-top:22px">Cellular Network</div>
+      <div class="kv-row"><span class="kv-label">Band</span><span class="kv-val" id="net-band">–</span></div>
+      <div class="kv-row"><span class="kv-label">Registration</span><span class="kv-val" id="net-registration">–</span></div>
+      <div class="kv-row"><span class="kv-label">APN</span><span class="kv-val" id="net-apn">–</span></div>
+      <div class="kv-row"><span class="kv-label">Roaming</span><span class="kv-val" id="net-roaming">–</span></div>
+      <div class="kv-row"><span class="kv-label">IPv6 Support</span><span class="kv-val" id="net-ipv6">–</span></div>
+      <div class="kv-row"><span class="kv-label">Cell ID</span><span class="kv-val" id="net-cid">–</span></div>
+      <div class="kv-row"><span class="kv-label">gNodeB ID</span><span class="kv-val" id="net-gnbid">–</span></div>
+
+      <div class="server-line" id="details-checked" style="margin:16px 0 0"></div>
     </div>
   </section>
 
@@ -932,6 +1117,43 @@ function setCell(id,val,unit){
   else{ el.innerHTML=val+(unit?'<span class="unit">'+unit+'</span>':''); }
 }
 
+function setKv(id,val){
+  document.getElementById(id).textContent = (val==null||val==='') ? '–' : val;
+}
+
+function fmtUptime(seconds){
+  if(seconds==null) return null;
+  const d=Math.floor(seconds/86400), h=Math.floor((seconds%86400)/3600), m=Math.floor((seconds%3600)/60);
+  const parts=[];
+  if(d) parts.push(d+'d');
+  if(d||h) parts.push(h+'h');
+  parts.push(m+'m');
+  return parts.join(' ');
+}
+
+let lastDeviceTs = 0;
+
+async function tickDevice(){
+  try{
+    const res = await fetch('/device?since='+lastDeviceTs);
+    const rows = await res.json();
+    if(rows.length){
+      const last = rows[rows.length-1];
+      lastDeviceTs = last.ts;
+      setKv('dev-model', last.model);
+      setKv('dev-manufacturer', last.manufacturer);
+      setKv('dev-hw', last.hardware_version);
+      setKv('dev-fw', last.software_version);
+      setKv('dev-update-state', last.update_state);
+      setKv('dev-uptime', last.ok===1 ? fmtUptime(last.uptime_seconds) : 'unavailable');
+      setKv('dev-serial', last.serial);
+      setKv('dev-mac', last.mac_id);
+      document.getElementById('details-checked').textContent =
+        (last.ok===1 ? 'last checked' : 'last check failed') + ' · ' + last.iso;
+    }
+  }catch(e){}
+}
+
 function renderBars(value){
   const n = value==null ? 0 : Math.round(value);
   document.querySelectorAll('#v-bars-icon .bar').forEach((bar,i)=>{
@@ -1080,6 +1302,14 @@ async function tick(){
       if(last.gnbid!=null) id.push('gNB '+last.gnbid);
       if(last.cid!=null) id.push('CID '+last.cid);
       document.getElementById('ident').textContent=id.join(' · ');
+
+      setKv('net-band', last.band);
+      setKv('net-registration', last.connection);
+      setKv('net-apn', last.apn);
+      setKv('net-roaming', last.roaming==null ? null : (last.roaming ? 'Yes' : 'No'));
+      setKv('net-ipv6', last.has_ipv6==null ? null : (last.has_ipv6 ? 'Yes' : 'No'));
+      setKv('net-cid', last.cid);
+      setKv('net-gnbid', last.gnbid);
     }
   }catch(e){
     document.getElementById('status-dot').classList.remove('live');
@@ -1292,6 +1522,8 @@ loadConfig();
 checkSpeedStatus();
 tickProgress();
 setInterval(tickProgress, 500);
+tickDevice();
+setInterval(tickDevice, POLL_MS);
 </script>
 </body>
 </html>
@@ -1360,6 +1592,15 @@ class Handler(BaseHTTPRequestHandler):
                 "db_path": RESOLVED_DB_PATH,
             }
             self._send(200, json.dumps(body).encode("utf-8"), "application/json")
+        elif self.path.startswith("/device"):
+            since = 0.0
+            if "since=" in self.path:
+                try:
+                    since = float(self.path.split("since=", 1)[1].split("&", 1)[0])
+                except ValueError:
+                    since = 0.0
+            rows = db_device_rows_since(self.server.conn, since)
+            self._send(200, json.dumps(rows).encode("utf-8"), "application/json")
         else:
             self._send(404, b"not found", "text/plain")
 
@@ -1421,6 +1662,8 @@ def main():
     stop_event = threading.Event()
     poller = threading.Thread(target=poller_loop, args=(conn, stop_event), daemon=True)
     poller.start()
+    device_poller = threading.Thread(target=device_loop, args=(conn, stop_event), daemon=True)
+    device_poller.start()
     speedtester = threading.Thread(target=speedtest_loop, args=(conn, stop_event), daemon=True)
     speedtester.start()
 
@@ -1430,6 +1673,7 @@ def main():
     print(f"TMHI Signal Monitor running.")
     print(f"  Gateway   : {CFG.get('gateway_url')}")
     print(f"  Poll      : every {CFG.get('poll_seconds')}s")
+    print(f"  Device    : every {CFG.get('device_poll_interval')}s")
     print(f"  Speedtest : every {CFG.get('speedtest_interval')}s via {CFG.get('speedtest_bin')}")
     print(f"  Storage   : {RESOLVED_DB_PATH}")
     print(f"  Listening : {CFG.get('http_host')}:{CFG.get('http_port')}")

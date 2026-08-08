@@ -86,6 +86,13 @@ gateway connects to, so don't paste real ones back in here. Everything else
 in the sample (signal levels, band, antenna, registration) is real captured
 shape/units, just not identifying on its own.
 
+The same caution applies to `?get=all`'s `device` section (added for the
+Details tab, see below): `serial` and `macId` are hardware-unique
+identifiers. Real values are fine to show live in *your own* dashboard —
+that's local, private, and the whole point — but if you're ever adding a
+"real sample" of that response to this doc (which is public), placeholder
+them the same way `cid`/`gNBID` are placeholdered above.
+
 Notes on that capture: it was taken during a site survey with the **external
 directional panel antenna temporarily indoors**, so the values (esp. `sinr: 0`)
 are not representative of normal service — don't treat them as a baseline. A
@@ -141,11 +148,23 @@ For both:
 - **`CONFIG_SCHEMA`** (top of file): one dict drives CLI flags, the persisted
   `config` table, and the web UI's Configuration tab. See "Configuration"
   below — don't add a new setting in only one of those three places.
-- **SQLite storage**: tables `signal_history`, `speedtest_history`, and
-  `config`. Writes serialized behind `_db_lock` because the background threads
-  and HTTP threads share one connection (`check_same_thread=False`).
+- **SQLite storage**: tables `signal_history`, `device_history`,
+  `speedtest_history`, and `config`. Writes serialized behind `_db_lock`
+  because the background threads and HTTP threads share one connection
+  (`check_same_thread=False`). New columns on an existing table (e.g.
+  `signal_history.apn`/`roaming`/`has_ipv6`, added after the table already
+  had rows) go through `_ensure_columns()` — an `ALTER TABLE ADD COLUMN` if
+  missing, not a second `CREATE TABLE` — so upgrading doesn't wipe history.
 - **Background poller thread**: calls `poll_gateway()` every `POLL_SECONDS`,
   inserts a row, prints a status line.
+- **Background device-info thread**: calls `poll_device()` every
+  `device_poll_interval` (default 5 min — model/firmware/serial essentially
+  never change and uptime doesn't need second-level resolution, unlike the
+  signal poll). Fetches `?get=all` on the *same host* as `gateway_url`
+  (`_device_info_url()` swaps just the query string via `urlsplit`/
+  `urlunsplit`, so it still works if you point `gateway_url` at a different
+  IP) and pulls out the `device` and `time` sections, ignoring the `signal`
+  section `get=all` also returns — that's already covered by the fast poller.
 - **Background speed test thread**: calls `run_speedtest()` every
   `speedtest_interval` (default 15 min — it's a real bandwidth-consuming
   transfer, unlike the 5s signal poll), but only when `speedtest_enabled` is
@@ -154,13 +173,21 @@ For both:
   scheduled run and a manual `/speed/run` trigger never overlap; the loser
   just no-ops rather than queuing.
 - **HTTP server** (`ThreadingHTTPServer`): serves `/` (dashboard HTML),
-  `/data?since=<ts>` and `/speed?since=<ts>` (JSON rows newer than a unix
-  timestamp; client polls incrementally and tracks `lastTs`/`lastSpeedTs`),
-  `/speed/run` (fire-and-forget trigger for an immediate speed test — refused
-  with `{"started": false}` if disabled or already running),
-  `/speed/status` (`{"enabled", "binary_path", "binary_found"}` — drives the
-  Connection tab's state, see below), and `/speed/progress` (live in-flight
-  test state, see below).
+  `/data?since=<ts>`, `/speed?since=<ts>`, and `/device?since=<ts>` (JSON rows
+  newer than a unix timestamp; client polls incrementally and tracks
+  `lastTs`/`lastSpeedTs`/`lastDeviceTs`), `/speed/run` (fire-and-forget
+  trigger for an immediate speed test — refused with `{"started": false}` if
+  disabled or already running), `/speed/status`
+  (`{"enabled", "binary_path", "binary_found"}` — drives the Connection tab's
+  state, see below), and `/speed/progress` (live in-flight test state, see
+  below). All three `*_rows_since` DB functions query `ORDER BY ts DESC LIMIT
+  5000` and reverse in Python, not `ORDER BY ts ASC LIMIT 5000` — with
+  `since=0` (full-history bootstrap) on a DB past 5000 rows, ASC+LIMIT
+  silently returns the *oldest* 5000 rows instead of anything recent (hit
+  this for real once `signal_history` passed 5000 rows — the dashboard's
+  initial chart load went stale). Incremental `since=<lastTs>` calls only
+  ever match a handful of rows under normal polling, so this doesn't change
+  their behavior, only the bootstrap case.
 - **Live speed test progress**: `run_speedtest()` runs the CLI via
   `subprocess.Popen` (not `subprocess.run`) with `--progress=yes
   --progress-update-interval=250`, so it streams `ping`/`download`/`upload`
@@ -178,7 +205,7 @@ For both:
   calls `tickSpeed()` rather than waiting for that function's own next cycle,
   so the final stored row (and the "Run test now" button re-enabling) lands
   within ~500ms instead of up to 5s.
-- **Dashboard**: three tabs, switched client-side (`.tab-btn` / `.tab-panel`,
+- **Dashboard**: four tabs, switched client-side (`.tab-btn` / `.tab-panel`,
   no reload). **Signal** tab: cyan = dB quality metrics, amber = dBm power
   metrics, dual-axis Chart.js line chart; SINR/RSRP readouts color-coded
   green/amber/red via `sinrColor`/`rsrpColor` (keep in sync with the
@@ -194,17 +221,29 @@ For both:
   tempted to hide it instead. Every readout has a hover tooltip (`data-tip`)
   and an info icon (`.info-btn`) that opens a shared details panel
   (`#detail-panel`); metric copy lives in the `METRIC_INFO` JS object —
-  extend it there when adding a new readout. **Configuration** tab: a form
-  rendered entirely from `GET /config`'s schema (`loadConfig()` in the
-  HTML) — no hardcoded field list on the frontend, so a new `CONFIG_SCHEMA`
-  entry appears here for free, checkbox or text/number input chosen by
-  `schema.type`.
+  extend it there when adding a new readout. **Details** tab (`#panel-details`
+  — not to be confused with `#detail-panel`, the unrelated metric-info popup
+  from the other two tabs): plain key/value rows, no chart, no thresholds.
+  "Device" section from `tickDevice()` polling `/device?since=<ts>`
+  (model/firmware/serial/MAC/uptime — `fmtUptime()` turns raw seconds into
+  `"1d 2h 30m"`). "Cellular Network" section is populated inside `tick()`
+  alongside the Signal tab's own cells, from the *same* `/data` row — APN,
+  roaming, IPv6 support, band, registration, CID, gNodeB ID are all already
+  in every signal poll response, just not shown on the Signal tab since
+  they're not signal-*strength* metrics. No separate request for this half.
+  **Configuration** tab: a form rendered entirely from `GET /config`'s
+  schema (`loadConfig()` in the HTML) — no hardcoded field list on the
+  frontend, so a new `CONFIG_SCHEMA` entry appears here for free, checkbox
+  or text/number input chosen by `schema.type`.
 
 ### DB schema
 
 - **`signal_history`**: `id, ts (unix float), iso (UTC str), ok (0/1),
-  connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid,
-  raw_json`
+  connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid, apn,
+  roaming, has_ipv6, raw_json`
+- **`device_history`**: `id, ts (unix float), iso (UTC str), ok (0/1),
+  manufacturer, model, hardware_version, software_version (firmware), serial,
+  mac_id, update_state, uptime_seconds, local_time, timezone, raw_json`
 - **`speedtest_history`**: `id, ts (unix float), iso (UTC str), ok (0/1),
   download_mbps, upload_mbps, ping_ms, jitter_ms, packet_loss, server_name,
   server_location, isp, raw_json`
