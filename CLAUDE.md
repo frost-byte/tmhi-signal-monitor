@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A small self-hosted tool that polls a **T-Mobile Home Internet gateway**
-(Arcadyan **TMO-G4AR**) for cellular signal telemetry, stores every reading in
-SQLite, and serves a live-updating browser dashboard.
+(Arcadyan **TMO-G4AR**) for cellular signal telemetry, runs periodic
+download/upload/ping/jitter speed tests, stores every reading in SQLite, and
+serves a live-updating two-tab browser dashboard (Signal / Connection).
 
 It exists because T-Mobile's current **T-Life** app no longer exposes the raw
 radio metrics (RSRP / RSRQ / SINR / RSSI / band) that the retired T-Mobile
@@ -14,7 +15,9 @@ Internet app used to show. Those metrics are still available from the gateway's
 **local HTTP API**, which is what this tool reads.
 
 Single file today: `tmhi_monitor.py`. Python 3.8+, **standard library only** on
-the backend. The dashboard pulls Chart.js from a CDN.
+the backend, except for the speed test, which shells out to the **Ookla
+Speedtest CLI** (a separate binary — see below). The dashboard pulls Chart.js
+from a CDN.
 
 ## Run it
 
@@ -23,8 +26,23 @@ python3 tmhi_monitor.py
 # then open http://localhost:8073   (Ctrl-C to stop)
 ```
 
-No dependencies to install. Must run on a machine that can reach the gateway at
-`192.168.12.1`.
+No Python dependencies to install. Must run on a machine that can reach the
+gateway at `192.168.12.1`.
+
+The speed test needs the **Ookla Speedtest CLI** binary at `SPEEDTEST_BIN`
+(default `~/.local/bin/speedtest`). No root required to install it — download
+the static tarball for your arch from `speedtest.net/apps/cli` and extract the
+`speedtest` binary into `~/.local/bin`:
+
+```bash
+curl -sL -o /tmp/speedtest.tgz https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz
+tar -xzf /tmp/speedtest.tgz -C ~/.local/bin speedtest
+chmod +x ~/.local/bin/speedtest
+```
+
+If the binary is missing or fails, speed tests just produce `ok=0` rows
+(same degrade-gracefully behavior as an unreachable gateway) — the rest of the
+app keeps working.
 
 ## The endpoint (verified working)
 
@@ -83,49 +101,73 @@ falls back to it if `5g` is absent.
 
 ## Architecture and the one rule that matters
 
-The design goal is **resilience to T-Mobile changing their schema/firmware**,
-not feature minimalism. Keep this boundary intact:
+The design goal is **resilience to upstream changes** (T-Mobile's gateway
+firmware/schema, and separately the Ookla CLI's output shape), not feature
+minimalism. There are now two parallel schema-aware boundaries, same shape:
 
-- **`poll_gateway()` is the only schema-aware code in the app.** It fetches,
-  parses defensively, and returns a *normalized* dict. Everything downstream
-  (storage, HTTP API, dashboard) works on that normalized shape and knows
-  nothing about T-Mobile's JSON. **If a firmware update renames or re-nests a
-  field, fix it here and nowhere else.**
+- **`poll_gateway()`** is the only T-Mobile-schema-aware code in the app.
+- **`run_speedtest()`** is the only Ookla-CLI-schema-aware code in the app.
+
+For both:
+- They fetch/execute, parse defensively, and return a *normalized* dict.
+  Everything downstream (storage, HTTP API, dashboard) works on that
+  normalized shape and knows nothing about the upstream JSON. **If a firmware
+  update or a new Ookla CLI version renames/re-nests a field, fix it in that
+  one function and nowhere else.**
 - **The full raw response is always stored** in the `raw_json` column,
-  regardless of whether parsing succeeded. This means no data is ever lost to a
-  schema change — you can backfill new columns from history later. Preserve this
-  behavior.
-- **Parsing never raises on expected failures.** An unreachable gateway or bad
-  body writes an `ok=0` row so outages appear as visible gaps, and the poller
-  keeps running. Keep failures non-fatal.
-- **The browser never talks to the gateway directly.** It fetches `/data` from
-  this server; only this process talks to `192.168.12.1`. This sidesteps the
-  cross-origin (CORS) block you'd hit fetching the gateway from a web page —
-  the gateway doesn't send CORS headers. Don't move the gateway fetch into
-  client-side JS.
+  regardless of whether parsing succeeded (for speed tests, this is the CLI's
+  full stdout+stderr — it emits one JSON object per line, and only the final
+  `"type":"result"` line is parsed). No data is ever lost to a schema change —
+  you can backfill new columns from history later. Preserve this behavior.
+- **Parsing never raises on expected failures.** An unreachable gateway, a
+  missing/failing `speedtest` binary, or a timeout all write an `ok=0` row so
+  outages appear as visible gaps, and the loop keeps running. Keep failures
+  non-fatal.
+- **The browser never talks to the gateway or runs the CLI directly.** It
+  fetches `/data` and `/speed` from this server; only this process touches
+  `192.168.12.1` or shells out to `speedtest`. This sidesteps the cross-origin
+  (CORS) block you'd hit fetching the gateway from a web page. Don't move
+  either into client-side JS.
 
 ### Components
 
 - **Config block** (top of file): `GATEWAY_URL`, `POLL_SECONDS`, `HTTP_PORT`,
-  `DB_PATH`, `FETCH_TIMEOUT`.
-- **SQLite storage**: table `signal_history`. Writes serialized behind
-  `_db_lock` because the poller thread and HTTP threads share one connection
-  (`check_same_thread=False`).
+  `DB_PATH`, `FETCH_TIMEOUT`, `SPEEDTEST_BIN`, `SPEEDTEST_INTERVAL`,
+  `SPEEDTEST_TIMEOUT`.
+- **SQLite storage**: tables `signal_history` and `speedtest_history`. Writes
+  serialized behind `_db_lock` because the background threads and HTTP threads
+  share one connection (`check_same_thread=False`).
 - **Background poller thread**: calls `poll_gateway()` every `POLL_SECONDS`,
   inserts a row, prints a status line.
-- **HTTP server** (`ThreadingHTTPServer`): serves `/` (dashboard HTML) and
-  `/data?since=<ts>` (JSON rows newer than a unix timestamp; client polls
-  incrementally and tracks `lastTs`).
-- **Dashboard**: instrument-panel styling. Cyan = dB quality metrics, amber =
-  dBm power metrics, mapped to a dual-axis Chart.js line chart. SINR and RSRP
-  readouts are color-coded green/amber/red using the thresholds in the table
-  above (see `sinrColor` / `rsrpColor` in the HTML — keep these in sync with any
-  documented threshold changes).
+- **Background speed test thread**: calls `run_speedtest()` every
+  `SPEEDTEST_INTERVAL` (default 15 min — it's a real bandwidth-consuming
+  transfer, unlike the 5s signal poll). Guarded by `_speedtest_lock` so a
+  scheduled run and a manual `/speed/run` trigger never overlap; the loser
+  just no-ops rather than queuing.
+- **HTTP server** (`ThreadingHTTPServer`): serves `/` (dashboard HTML),
+  `/data?since=<ts>` and `/speed?since=<ts>` (JSON rows newer than a unix
+  timestamp; client polls incrementally and tracks `lastTs`/`lastSpeedTs`),
+  and `/speed/run` (fire-and-forget trigger for an immediate speed test,
+  returns `{"started": false}` if one's already in flight).
+- **Dashboard**: two tabs, switched client-side (`.tab-btn` / `.tab-panel`,
+  no reload). **Signal** tab: cyan = dB quality metrics, amber = dBm power
+  metrics, dual-axis Chart.js line chart; SINR/RSRP readouts color-coded
+  green/amber/red via `sinrColor`/`rsrpColor` (keep in sync with the
+  thresholds table above). **Connection** tab: violet = Mbps bandwidth,
+  rose = ms latency, its own dual-axis chart, plus a "Run test now" button.
+  Every readout has a hover tooltip (`data-tip`) and an info icon
+  (`.info-btn`) that opens a shared details panel (`#detail-panel`); metric
+  copy lives in the `METRIC_INFO` JS object — extend it there when adding
+  a new readout.
 
-### DB schema (`signal_history`)
+### DB schema
 
-`id, ts (unix float), iso (UTC str), ok (0/1), connection, antenna, band,
-bars, rsrp, rsrq, sinr, rssi, cid, gnbid, raw_json`
+- **`signal_history`**: `id, ts (unix float), iso (UTC str), ok (0/1),
+  connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid,
+  raw_json`
+- **`speedtest_history`**: `id, ts (unix float), iso (UTC str), ok (0/1),
+  download_mbps, upload_mbps, ping_ms, jitter_ms, packet_loss, server_name,
+  server_location, isp, raw_json`
 
 ## Known constraints and gotchas
 
@@ -148,6 +190,16 @@ bars, rsrp, rsrq, sinr, rssi, cid, gnbid, raw_json`
   and per-model differences: the open-source **HINT Control** app
   (`github.com/zacharee/HINTControl`). Consult it before reverse-engineering
   anything new.
+- **Speed tests cost real bandwidth and time** (~15–30s each, saturating the
+  link). Don't lower `SPEEDTEST_INTERVAL` casually — this isn't a lightweight
+  poll like the signal check.
+- **Ookla CLI output is multi-line NDJSON**, not a single JSON document: log
+  lines interleave with progress, and the row you want is the *last* line
+  where `"type":"result"`. `run_speedtest()` already handles this — don't
+  `json.loads()` the whole stdout blob directly.
+- **`speedtest --accept-license --accept-gdpr` is required** on first run (and
+  harmless on every run after) or the CLI blocks waiting for interactive
+  consent. Already baked into `run_speedtest()`'s invocation — don't drop it.
 
 ## Backlog (roughly prioritized) — none of this is committed yet
 

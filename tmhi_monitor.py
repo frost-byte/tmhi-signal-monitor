@@ -14,13 +14,18 @@ Design note (the whole point of v0):
   When a firmware update breaks something, you fix ONE function, not the app.
 
 Requirements: Python 3.8+  (standard library only). A browser for the dashboard.
+Also polls upload/download/ping/jitter via the Ookla Speedtest CLI (a separate
+binary, shelled out to -- see SPEEDTEST_BIN below). Missing/failing binary
+degrades to ok=0 rows, same as an unreachable gateway; it never crashes the app.
 Run:          python3 tmhi_monitor.py
 Then open:    http://localhost:8073
 Stop:         Ctrl-C
 """
 
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 import urllib.request
@@ -35,6 +40,10 @@ POLL_SECONDS  = 5          # how often to poll the gateway
 HTTP_PORT     = 8073       # dashboard served at http://localhost:<PORT>
 DB_PATH       = "tmhi_signal.db"
 FETCH_TIMEOUT = 8          # seconds before a gateway request gives up
+
+SPEEDTEST_BIN      = os.path.expanduser("~/.local/bin/speedtest")  # Ookla CLI
+SPEEDTEST_INTERVAL = 900   # seconds between full speed tests (15 min)
+SPEEDTEST_TIMEOUT  = 90    # seconds before giving up on a speed test
 
 # ----------------------------------------------------------------------------
 # STORAGE
@@ -69,6 +78,25 @@ def db_init(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ts ON signal_history(ts)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS speedtest_history (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              REAL NOT NULL,
+            iso             TEXT NOT NULL,
+            ok              INTEGER NOT NULL,   -- 1 = test completed, 0 = failed/timed out
+            download_mbps   REAL,
+            upload_mbps     REAL,
+            ping_ms         REAL,
+            jitter_ms       REAL,
+            packet_loss     REAL,               -- percent, when reported
+            server_name     TEXT,
+            server_location TEXT,
+            isp             TEXT,
+            raw_json        TEXT                -- full CLI stdout+stderr, always kept
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_speed_ts ON speedtest_history(ts)")
     conn.commit()
 
 def db_insert(conn, row):
@@ -86,6 +114,28 @@ def db_rows_since(conn, since_ts):
         cur = conn.execute(
             "SELECT ts, iso, ok, connection, antenna, band, bars, rsrp, rsrq, sinr, rssi, cid, gnbid "
             "FROM signal_history WHERE ts > ? ORDER BY ts ASC LIMIT 5000",
+            (since_ts,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+def db_insert_speed(conn, row):
+    with _db_lock:
+        conn.execute("""
+            INSERT INTO speedtest_history
+              (ts, iso, ok, download_mbps, upload_mbps, ping_ms, jitter_ms, packet_loss,
+               server_name, server_location, isp, raw_json)
+            VALUES
+              (:ts, :iso, :ok, :download_mbps, :upload_mbps, :ping_ms, :jitter_ms, :packet_loss,
+               :server_name, :server_location, :isp, :raw_json)
+        """, row)
+        conn.commit()
+
+def db_speed_rows_since(conn, since_ts):
+    with _db_lock:
+        cur = conn.execute(
+            "SELECT ts, iso, ok, download_mbps, upload_mbps, ping_ms, jitter_ms, packet_loss, "
+            "server_name, server_location, isp "
+            "FROM speedtest_history WHERE ts > ? ORDER BY ts ASC LIMIT 5000",
             (since_ts,),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -182,6 +232,104 @@ def poller_loop(conn, stop_event):
         stop_event.wait(POLL_SECONDS)
 
 # ----------------------------------------------------------------------------
+# SPEED TEST  -  the only Ookla-CLI-schema-aware code in the app. Same rule as
+# poll_gateway(): if Ookla changes their JSON, fix it HERE. Full CLI output is
+# always stored in raw_json, and failures (missing binary, no network, timeout)
+# produce a normal ok=0 row instead of raising.
+# ----------------------------------------------------------------------------
+def run_speedtest():
+    now = time.time()
+    iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    base = {
+        "ts": now, "iso": iso, "ok": 0,
+        "download_mbps": None, "upload_mbps": None, "ping_ms": None, "jitter_ms": None,
+        "packet_loss": None, "server_name": None, "server_location": None, "isp": None,
+        "raw_json": None,
+    }
+
+    try:
+        proc = subprocess.run(
+            [SPEEDTEST_BIN, "--accept-license", "--accept-gdpr", "-f", "json"],
+            capture_output=True, text=True, timeout=SPEEDTEST_TIMEOUT,
+        )
+    except Exception as e:
+        base["raw_json"] = json.dumps({"_exec_error": str(e)})
+        return base
+
+    stdout = proc.stdout or ""
+    base["raw_json"] = stdout + (proc.stderr or "")
+
+    # The CLI prints one JSON object per line (progress/log lines, then a
+    # final line with "type":"result"). Only the result line matters here.
+    result = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") == "result":
+            result = obj
+
+    if result is None:
+        return base
+
+    dl     = _dig(result, "download", default={}) or {}
+    ul     = _dig(result, "upload", default={}) or {}
+    ping   = _dig(result, "ping", default={}) or {}
+    server = _dig(result, "server", default={}) or {}
+
+    def bytes_to_mbps(b):
+        return round(b * 8 / 1_000_000, 2) if isinstance(b, (int, float)) else None
+
+    def round1(v):
+        return round(v, 1) if isinstance(v, (int, float)) else None
+
+    base.update({
+        "ok": 1,
+        "download_mbps": bytes_to_mbps(dl.get("bandwidth")),
+        "upload_mbps": bytes_to_mbps(ul.get("bandwidth")),
+        "ping_ms": round1(ping.get("latency")),
+        "jitter_ms": round1(ping.get("jitter")),
+        "packet_loss": result.get("packetLoss"),
+        "server_name": server.get("name"),
+        "server_location": server.get("location"),
+        "isp": result.get("isp"),
+    })
+    return base
+
+# ----------------------------------------------------------------------------
+# BACKGROUND SPEED TEST LOOP
+# ----------------------------------------------------------------------------
+_speedtest_lock = threading.Lock()
+
+def run_one_speedtest(conn):
+    """Run + store a single speed test. Returns False without running if one
+    is already in progress (scheduled loop and manual /speed/run share this)."""
+    if not _speedtest_lock.acquire(blocking=False):
+        return False
+    try:
+        reading = run_speedtest()
+        try:
+            db_insert_speed(conn, reading)
+            status = "ok" if reading["ok"] else "FAILED"
+            print(f"[{reading['iso']}] speedtest {status}  "
+                  f"down={reading['download_mbps']}Mbps  up={reading['upload_mbps']}Mbps  "
+                  f"ping={reading['ping_ms']}ms  jitter={reading['jitter_ms']}ms")
+        except Exception as e:
+            print(f"[speedtest] insert failed: {e}")
+    finally:
+        _speedtest_lock.release()
+    return True
+
+def speedtest_loop(conn, stop_event):
+    while not stop_event.is_set():
+        run_one_speedtest(conn)
+        stop_event.wait(SPEEDTEST_INTERVAL)
+
+# ----------------------------------------------------------------------------
 # WEB DASHBOARD  -  served inline; talks only to this server (no CORS issues).
 # The browser can't fetch the gateway directly (cross-origin), so the page
 # fetches /data from here, and only this process talks to 192.168.12.1.
@@ -199,6 +347,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     --text:#c9d4df; --dim:#6b7c8f;
     --amber:#f5a524;   /* dBm  power  metrics */
     --cyan:#38bdf8;    /* dB   quality metrics */
+    --violet:#a78bfa;  /* Mbps bandwidth metrics */
+    --rose:#f472b6;    /* ms   latency metrics */
     --good:#3fb950; --warn:#d29922; --bad:#f85149;
     --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
   }
@@ -213,6 +363,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               background:var(--bad);margin-right:6px;vertical-align:middle}
   #status-dot.live{background:var(--good);box-shadow:0 0 8px var(--good)}
   .wrap{padding:20px;max-width:1100px;margin:0 auto}
+  .tabs{display:flex;margin-bottom:16px;border-bottom:1px solid var(--line)}
+  .tab-btn{background:none;border:none;color:var(--dim);font-family:var(--mono);
+    font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:10px 4px;
+    margin-right:22px;cursor:pointer;border-bottom:2px solid transparent}
+  .tab-btn:hover{color:var(--text)}
+  .tab-btn.active{color:var(--text);border-bottom-color:var(--cyan)}
+  .tab-panel.hidden{display:none}
   .readouts{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:20px}
   .cell{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
   .cell .lab{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
@@ -220,7 +377,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .cell .unit{font-size:12px;color:var(--dim);margin-left:3px}
   .cell.power .val{color:var(--amber)}
   .cell.quality .val{color:var(--cyan)}
+  .cell.bw .val{color:var(--violet)}
+  .cell.lat .val{color:var(--rose)}
   .cell.small .val{font-size:15px;font-weight:500;color:var(--text)}
+  .server-line{color:var(--dim);font-size:12px;margin:-10px 0 18px}
+  .btn{background:var(--panel);border:1px solid var(--line);color:var(--text);
+    border-radius:6px;padding:5px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
+  .btn:hover{border-color:var(--cyan)}
+  .btn:disabled{opacity:.5;cursor:default}
   .lab{display:flex;align-items:center;gap:5px}
   [data-tip]{position:relative}
   [data-tip]:hover::after,[data-tip]:focus-within::after{
@@ -278,52 +442,91 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </header>
 
 <div class="wrap">
-  <div class="readouts">
-    <div class="cell quality" data-tip="Signal-to-noise ratio — the single best overall quality indicator">
-      <div class="lab">SINR<button class="info-btn" data-metric="sinr" aria-label="About SINR">i</button></div>
-      <div class="val" id="v-sinr">–<span class="unit">dB</span></div>
-    </div>
-    <div class="cell power" data-tip="Signal power — reflects raw coverage strength">
-      <div class="lab">RSRP<button class="info-btn" data-metric="rsrp" aria-label="About RSRP">i</button></div>
-      <div class="val" id="v-rsrp">–<span class="unit">dBm</span></div>
-    </div>
-    <div class="cell quality" data-tip="Signal quality, accounting for interference from other cells">
-      <div class="lab">RSRQ<button class="info-btn" data-metric="rsrq" aria-label="About RSRQ">i</button></div>
-      <div class="val" id="v-rsrq">–<span class="unit">dB</span></div>
-    </div>
-    <div class="cell power" data-tip="Total received power — signal plus interference plus noise">
-      <div class="lab">RSSI<button class="info-btn" data-metric="rssi" aria-label="About RSSI">i</button></div>
-      <div class="val" id="v-rssi">–<span class="unit">dBm</span></div>
-    </div>
-    <div class="cell small" data-tip="Active 5G frequency band(s), e.g. n71">
-      <div class="lab">Band<button class="info-btn" data-metric="band" aria-label="About Band">i</button></div>
-      <div class="val" id="v-band">–</div>
-    </div>
-    <div class="cell small" data-tip="Coarse indicator based on RSRP only — ignores SINR">
-      <div class="lab">Bars<button class="info-btn" data-metric="bars" aria-label="About Bars">i</button></div>
-      <div class="bars-icon" id="v-bars-icon" aria-hidden="true">
-        <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
-      </div>
-      <div class="bars-num" id="v-bars-num">–</div>
-    </div>
-    <div class="cell small" data-tip="Which antenna the gateway is currently using">
-      <div class="lab">Antenna<button class="info-btn" data-metric="antenna" aria-label="About Antenna">i</button></div>
-      <div class="val" id="v-ant">–</div>
-    </div>
-    <div class="cell small" data-tip="Gateway's registration status on the network">
-      <div class="lab">State<button class="info-btn" data-metric="conn" aria-label="About connection state">i</button></div>
-      <div class="val" id="v-conn">–</div>
-    </div>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="signal">Signal</button>
+    <button class="tab-btn" data-tab="speed">Connection</button>
   </div>
 
-  <div class="chartbox">
-    <div class="chart-tools">
-      <span><span class="swatch" style="background:#38bdf8"></span>quality axis (dB) — SINR, RSRQ</span>
-      <span><span class="swatch" style="background:#f5a524"></span>power axis (dBm) — RSRP, RSSI</span>
-      <label style="margin-left:auto"><input type="checkbox" id="tgl-power" checked> show power</label>
+  <section class="tab-panel" id="panel-signal">
+    <div class="readouts">
+      <div class="cell quality" data-tip="Signal-to-noise ratio — the single best overall quality indicator">
+        <div class="lab">SINR<button class="info-btn" data-metric="sinr" aria-label="About SINR">i</button></div>
+        <div class="val" id="v-sinr">–<span class="unit">dB</span></div>
+      </div>
+      <div class="cell power" data-tip="Signal power — reflects raw coverage strength">
+        <div class="lab">RSRP<button class="info-btn" data-metric="rsrp" aria-label="About RSRP">i</button></div>
+        <div class="val" id="v-rsrp">–<span class="unit">dBm</span></div>
+      </div>
+      <div class="cell quality" data-tip="Signal quality, accounting for interference from other cells">
+        <div class="lab">RSRQ<button class="info-btn" data-metric="rsrq" aria-label="About RSRQ">i</button></div>
+        <div class="val" id="v-rsrq">–<span class="unit">dB</span></div>
+      </div>
+      <div class="cell power" data-tip="Total received power — signal plus interference plus noise">
+        <div class="lab">RSSI<button class="info-btn" data-metric="rssi" aria-label="About RSSI">i</button></div>
+        <div class="val" id="v-rssi">–<span class="unit">dBm</span></div>
+      </div>
+      <div class="cell small" data-tip="Active 5G frequency band(s), e.g. n71">
+        <div class="lab">Band<button class="info-btn" data-metric="band" aria-label="About Band">i</button></div>
+        <div class="val" id="v-band">–</div>
+      </div>
+      <div class="cell small" data-tip="Coarse indicator based on RSRP only — ignores SINR">
+        <div class="lab">Bars<button class="info-btn" data-metric="bars" aria-label="About Bars">i</button></div>
+        <div class="bars-icon" id="v-bars-icon" aria-hidden="true">
+          <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+        </div>
+        <div class="bars-num" id="v-bars-num">–</div>
+      </div>
+      <div class="cell small" data-tip="Which antenna the gateway is currently using">
+        <div class="lab">Antenna<button class="info-btn" data-metric="antenna" aria-label="About Antenna">i</button></div>
+        <div class="val" id="v-ant">–</div>
+      </div>
+      <div class="cell small" data-tip="Gateway's registration status on the network">
+        <div class="lab">State<button class="info-btn" data-metric="conn" aria-label="About connection state">i</button></div>
+        <div class="val" id="v-conn">–</div>
+      </div>
     </div>
-    <div class="chart-wrap"><canvas id="chart"></canvas></div>
-  </div>
+
+    <div class="chartbox">
+      <div class="chart-tools">
+        <span><span class="swatch" style="background:#38bdf8"></span>quality axis (dB) — SINR, RSRQ</span>
+        <span><span class="swatch" style="background:#f5a524"></span>power axis (dBm) — RSRP, RSSI</span>
+        <label style="margin-left:auto"><input type="checkbox" id="tgl-power" checked> show power</label>
+      </div>
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    </div>
+  </section>
+
+  <section class="tab-panel hidden" id="panel-speed">
+    <div class="readouts">
+      <div class="cell bw" data-tip="How fast data can be pulled from the internet">
+        <div class="lab">Download<button class="info-btn" data-metric="download" aria-label="About Download">i</button></div>
+        <div class="val" id="v-dl">–<span class="unit">Mbps</span></div>
+      </div>
+      <div class="cell bw" data-tip="How fast data can be sent to the internet">
+        <div class="lab">Upload<button class="info-btn" data-metric="upload" aria-label="About Upload">i</button></div>
+        <div class="val" id="v-ul">–<span class="unit">Mbps</span></div>
+      </div>
+      <div class="cell lat" data-tip="Round-trip time to the test server">
+        <div class="lab">Ping<button class="info-btn" data-metric="ping" aria-label="About Ping">i</button></div>
+        <div class="val" id="v-ping">–<span class="unit">ms</span></div>
+      </div>
+      <div class="cell lat" data-tip="How much the ping time varies between samples">
+        <div class="lab">Jitter<button class="info-btn" data-metric="jitter" aria-label="About Jitter">i</button></div>
+        <div class="val" id="v-jitter">–<span class="unit">ms</span></div>
+      </div>
+    </div>
+    <div class="server-line" id="speed-server">no speed test data yet</div>
+
+    <div class="chartbox">
+      <div class="chart-tools">
+        <span><span class="swatch" style="background:#a78bfa"></span>bandwidth axis (Mbps) — Download, Upload</span>
+        <span><span class="swatch" style="background:#f472b6"></span>latency axis (ms) — Ping, Jitter</span>
+        <button class="btn" id="speed-run-btn" style="margin-left:auto">Run test now</button>
+        <span class="meta" id="speed-run-status"></span>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-speed"></canvas></div>
+    </div>
+  </section>
 
   <div class="detail-panel hidden" id="detail-panel">
     <div class="detail-head">
@@ -334,11 +537,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<footer>polling every POLL_SECONDS_PLACEHOLDER s · history in tmhi_signal.db · this page only talks to localhost</footer>
+<footer>signal every POLL_SECONDS_PLACEHOLDER s · speed test every SPEEDTEST_INTERVAL_PLACEHOLDER s · history in tmhi_signal.db · this page only talks to localhost</footer>
 
 <script>
 const POLL_MS = POLL_MS_PLACEHOLDER;
 let lastTs = 0;
+let lastSpeedTs = 0;
+let pendingSpeedTest = false;
+
+document.querySelectorAll('.tab-btn').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active', b===btn));
+    document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('hidden', p.id !== 'panel-'+btn.dataset.tab));
+  });
+});
 
 function sinrColor(v){ if(v==null) return "var(--dim)"; if(v>=13) return "var(--good)"; if(v>=5) return "var(--warn)"; return "var(--bad)"; }
 function rsrpColor(v){ if(v==null) return "var(--dim)"; if(v>=-90) return "var(--good)"; if(v>=-105) return "var(--warn)"; return "var(--bad)"; }
@@ -377,6 +589,52 @@ document.getElementById('tgl-power').addEventListener('change',e=>{
   chart.data.datasets[3].hidden=!on;
   chart.options.scales.yP.display=on;
   chart.update();
+});
+
+const ctxSpeed = document.getElementById('chart-speed').getContext('2d');
+const chartSpeed = new Chart(ctxSpeed,{
+  type:'line',
+  data:{datasets:[
+    mk('Download','#a78bfa','yBw'),
+    mk('Upload','#c4b5fd','yBw'),
+    mk('Ping','#f472b6','yLat'),
+    mk('Jitter','#fbcfe8','yLat'),
+  ]},
+  options:{
+    animation:false, parsing:false, maintainAspectRatio:false,
+    interaction:{mode:'index',intersect:false},
+    scales:{
+      x:{type:'linear',
+         ticks:{color:'#6b7c8f',maxTicksLimit:8,
+                callback:v=>new Date(v*1000).toLocaleTimeString()},
+         grid:{color:'#233040'}},
+      yBw:{position:'left',beginAtZero:true,title:{display:true,text:'Mbps',color:'#a78bfa'},
+          ticks:{color:'#6b7c8f'},grid:{color:'#233040'}},
+      yLat:{position:'right',beginAtZero:true,title:{display:true,text:'ms',color:'#f472b6'},
+          ticks:{color:'#6b7c8f'},grid:{drawOnChartArea:false}},
+    },
+    plugins:{legend:{labels:{color:'#c9d4df',boxWidth:12}}}
+  }
+});
+
+document.getElementById('speed-run-btn').addEventListener('click', async ()=>{
+  const btn = document.getElementById('speed-run-btn');
+  const status = document.getElementById('speed-run-status');
+  btn.disabled = true;
+  try{
+    const res = await fetch('/speed/run');
+    const data = await res.json();
+    if(data.started){
+      pendingSpeedTest = true;
+      status.textContent = 'running… (~15–30s)';
+    }else{
+      status.textContent = data.reason || 'already running';
+      btn.disabled = false;
+    }
+  }catch(e){
+    status.textContent = 'failed to start';
+    btn.disabled = false;
+  }
 });
 
 function setCell(id,val,unit){
@@ -451,6 +709,30 @@ const METRIC_INFO = {
     body: "<p>The gateway's registration status on the T-Mobile network — normally "
         + '<code>registered</code>. Anything else, or the status dot going red, indicates the '
         + 'gateway has lost its connection.</p>'
+  },
+  download: {
+    title: 'Download Speed',
+    body: '<p>How fast data can be pulled from the internet to this connection, in Mbps '
+        + '(megabits per second), measured with a real transfer to a nearby test server. This is '
+        + 'the number that drives streaming quality, download times, and general browsing feel.</p>'
+  },
+  upload: {
+    title: 'Upload Speed',
+    body: '<p>How fast data can be sent from this connection to the internet, in Mbps. Matters for '
+        + 'video calls, cloud backups, and uploading files — fixed wireless connections like this '
+        + 'one are often asymmetric, with upload well below download.</p>'
+  },
+  ping: {
+    title: 'Ping (Latency)',
+    body: '<p>Round-trip time to the test server, in milliseconds — how long a request takes to '
+        + 'get a response. Lower is better; it matters most for anything real-time (calls, gaming, '
+        + 'remote desktops) rather than for raw throughput.</p>'
+  },
+  jitter: {
+    title: 'Jitter',
+    body: '<p>How much the ping time varies between samples, in milliseconds. High jitter means '
+        + "the connection is inconsistent even when average latency looks fine — it's often what "
+        + 'makes a call choppy even when the ping number itself looks okay.</p>'
   }
 };
 
@@ -516,6 +798,44 @@ async function tick(){
   }
 }
 
+async function tickSpeed(){
+  try{
+    const res = await fetch('/speed?since='+lastSpeedTs);
+    const rows = await res.json();
+    if(rows.length){
+      for(const r of rows){
+        chartSpeed.data.datasets[0].data.push({x:r.ts,y:r.download_mbps});
+        chartSpeed.data.datasets[1].data.push({x:r.ts,y:r.upload_mbps});
+        chartSpeed.data.datasets[2].data.push({x:r.ts,y:r.ping_ms});
+        chartSpeed.data.datasets[3].data.push({x:r.ts,y:r.jitter_ms});
+        lastSpeedTs = r.ts;
+      }
+      // keep the window manageable (last 1000 tests)
+      for(const ds of chartSpeed.data.datasets){ if(ds.data.length>1000) ds.data.splice(0,ds.data.length-1000); }
+      chartSpeed.update();
+
+      const last = rows[rows.length-1];
+      setCell('v-dl', last.download_mbps, 'Mbps');
+      setCell('v-ul', last.upload_mbps, 'Mbps');
+      setCell('v-ping', last.ping_ms, 'ms');
+      setCell('v-jitter', last.jitter_ms, 'ms');
+
+      const parts=[];
+      if(last.server_name) parts.push(last.server_name);
+      if(last.server_location) parts.push(last.server_location);
+      if(last.isp) parts.push(last.isp);
+      document.getElementById('speed-server').textContent =
+        (last.ok===1 ? parts.join(' · ') : 'last test failed') + ' · ' + last.iso;
+
+      if(pendingSpeedTest){
+        pendingSpeedTest = false;
+        document.getElementById('speed-run-btn').disabled = false;
+        document.getElementById('speed-run-status').textContent = 'done · '+last.iso;
+      }
+    }
+  }catch(e){ /* signal tick() already surfaces a dashboard-offline state */ }
+}
+
 // On first load, pull recent history so the chart isn't empty.
 (async function bootstrap(){
   try{
@@ -534,6 +854,24 @@ async function tick(){
   }catch(e){}
   tick();
   setInterval(tick, POLL_MS);
+})();
+
+(async function bootstrapSpeed(){
+  try{
+    const res=await fetch('/speed?since=0');
+    const rows=await res.json();
+    const recent = rows.slice(-1000);
+    for(const r of recent){
+      chartSpeed.data.datasets[0].data.push({x:r.ts,y:r.download_mbps});
+      chartSpeed.data.datasets[1].data.push({x:r.ts,y:r.upload_mbps});
+      chartSpeed.data.datasets[2].data.push({x:r.ts,y:r.ping_ms});
+      chartSpeed.data.datasets[3].data.push({x:r.ts,y:r.jitter_ms});
+      lastSpeedTs=r.ts;
+    }
+    chartSpeed.update();
+  }catch(e){}
+  tickSpeed();
+  setInterval(tickSpeed, POLL_MS);
 })();
 </script>
 </body>
@@ -557,7 +895,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/" or self.path.startswith("/index"):
             html = (DASHBOARD_HTML
                     .replace("POLL_MS_PLACEHOLDER", str(POLL_SECONDS * 1000))
-                    .replace("POLL_SECONDS_PLACEHOLDER", str(POLL_SECONDS)))
+                    .replace("POLL_SECONDS_PLACEHOLDER", str(POLL_SECONDS))
+                    .replace("SPEEDTEST_INTERVAL_PLACEHOLDER", str(SPEEDTEST_INTERVAL)))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path.startswith("/data"):
             since = 0.0
@@ -567,6 +906,22 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     since = 0.0
             rows = db_rows_since(self.server.conn, since)
+            self._send(200, json.dumps(rows).encode("utf-8"), "application/json")
+        elif self.path.startswith("/speed/run"):
+            if _speedtest_lock.locked():
+                body = {"started": False, "reason": "a speed test is already running"}
+            else:
+                threading.Thread(target=run_one_speedtest, args=(self.server.conn,), daemon=True).start()
+                body = {"started": True}
+            self._send(200, json.dumps(body).encode("utf-8"), "application/json")
+        elif self.path.startswith("/speed"):
+            since = 0.0
+            if "since=" in self.path:
+                try:
+                    since = float(self.path.split("since=", 1)[1].split("&", 1)[0])
+                except ValueError:
+                    since = 0.0
+            rows = db_speed_rows_since(self.server.conn, since)
             self._send(200, json.dumps(rows).encode("utf-8"), "application/json")
         else:
             self._send(404, b"not found", "text/plain")
@@ -578,15 +933,18 @@ def main():
     stop_event = threading.Event()
     poller = threading.Thread(target=poller_loop, args=(conn, stop_event), daemon=True)
     poller.start()
+    speedtester = threading.Thread(target=speedtest_loop, args=(conn, stop_event), daemon=True)
+    speedtester.start()
 
     server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
     server.conn = conn
 
     print(f"TMHI Signal Monitor running.")
-    print(f"  Gateway : {GATEWAY_URL}")
-    print(f"  Poll    : every {POLL_SECONDS}s")
-    print(f"  Storage : {DB_PATH}")
-    print(f"  Dashboard: http://localhost:{HTTP_PORT}   (Ctrl-C to stop)")
+    print(f"  Gateway   : {GATEWAY_URL}")
+    print(f"  Poll      : every {POLL_SECONDS}s")
+    print(f"  Speedtest : every {SPEEDTEST_INTERVAL}s via {SPEEDTEST_BIN}")
+    print(f"  Storage   : {DB_PATH}")
+    print(f"  Dashboard : http://localhost:{HTTP_PORT}   (Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
