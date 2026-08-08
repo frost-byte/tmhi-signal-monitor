@@ -141,27 +141,40 @@ For both:
 - **Background poller thread**: calls `poll_gateway()` every `POLL_SECONDS`,
   inserts a row, prints a status line.
 - **Background speed test thread**: calls `run_speedtest()` every
-  `SPEEDTEST_INTERVAL` (default 15 min — it's a real bandwidth-consuming
-  transfer, unlike the 5s signal poll). Guarded by `_speedtest_lock` so a
+  `speedtest_interval` (default 15 min — it's a real bandwidth-consuming
+  transfer, unlike the 5s signal poll), but only when `speedtest_enabled` is
+  true (checked fresh each cycle — toggling it in the Configuration tab takes
+  effect on the next cycle, no restart). Guarded by `_speedtest_lock` so a
   scheduled run and a manual `/speed/run` trigger never overlap; the loser
   just no-ops rather than queuing.
 - **HTTP server** (`ThreadingHTTPServer`): serves `/` (dashboard HTML),
   `/data?since=<ts>` and `/speed?since=<ts>` (JSON rows newer than a unix
   timestamp; client polls incrementally and tracks `lastTs`/`lastSpeedTs`),
-  and `/speed/run` (fire-and-forget trigger for an immediate speed test,
-  returns `{"started": false}` if one's already in flight).
+  `/speed/run` (fire-and-forget trigger for an immediate speed test — refused
+  with `{"started": false}` if disabled or already running), and
+  `/speed/status` (`{"enabled", "binary_path", "binary_found"}` — drives the
+  Connection tab's state, see below).
 - **Dashboard**: three tabs, switched client-side (`.tab-btn` / `.tab-panel`,
   no reload). **Signal** tab: cyan = dB quality metrics, amber = dBm power
   metrics, dual-axis Chart.js line chart; SINR/RSRP readouts color-coded
   green/amber/red via `sinrColor`/`rsrpColor` (keep in sync with the
   thresholds table above). **Connection** tab: violet = Mbps bandwidth,
-  rose = ms latency, its own dual-axis chart, plus a "Run test now" button.
-  Every readout has a hover tooltip (`data-tip`) and an info icon
-  (`.info-btn`) that opens a shared details panel (`#detail-panel`); metric
-  copy lives in the `METRIC_INFO` JS object — extend it there when adding
-  a new readout. **Configuration** tab: a form rendered entirely from
-  `GET /config`'s schema (`loadConfig()` in the HTML) — no hardcoded field
-  list on the frontend, so a new `CONFIG_SCHEMA` entry appears here for free.
+  rose = ms latency, its own dual-axis chart, plus a "Run test now" button —
+  but the tab renders one of three states based on `checkSpeedStatus()`
+  polling `/speed/status`: normal content (`#speed-active`), a "disabled"
+  notice with a button that jumps to Configuration (`#speed-disabled-notice`),
+  or a "binary not found" notice with install instructions
+  (`#speed-binary-missing-notice`). The tab itself is **never hidden** —
+  intentional, so there's always a place to discover why it's inactive and
+  how to fix it; see "Configuration" below for the reasoning if you're
+  tempted to hide it instead. Every readout has a hover tooltip (`data-tip`)
+  and an info icon (`.info-btn`) that opens a shared details panel
+  (`#detail-panel`); metric copy lives in the `METRIC_INFO` JS object —
+  extend it there when adding a new readout. **Configuration** tab: a form
+  rendered entirely from `GET /config`'s schema (`loadConfig()` in the
+  HTML) — no hardcoded field list on the frontend, so a new `CONFIG_SCHEMA`
+  entry appears here for free, checkbox or text/number input chosen by
+  `schema.type`.
 
 ### DB schema
 
@@ -177,9 +190,10 @@ For both:
 ## Configuration
 
 Settings live in `CONFIG_SCHEMA` (top of file) — one dict per setting with
-`type`, `default`, `label`, `help`, `unit`, `restart_required`, and a
-`validate` function. That single schema generates three things, so adding a
-setting means editing `CONFIG_SCHEMA` once, not three places:
+`type` (`str` / `int` / `bool` — `bool` renders as a checkbox in the UI),
+`default`, `label`, `help`, `unit`, `restart_required`, and a `validate`
+function. That single schema generates three things, so adding a setting
+means editing `CONFIG_SCHEMA` once, not three places:
 
 1. **A CLI flag** (`--poll-seconds`, `--gateway-url`, etc. — `python3
    tmhi_monitor.py --help` for the full list).
@@ -215,6 +229,19 @@ to `127.0.0.1` to restrict the dashboard to this machine only.
 (e.g. `poll_seconds >= 1`, `1 <= http_port <= 65535`) before writing to the
 DB; `POST /config` reports failures per-field in `errors` rather than
 rejecting the whole request, so one bad field doesn't block the rest.
+
+**Speed testing is opt-out, not opt-in**: `speedtest_enabled` defaults to
+`true` because that's what the app already did before the toggle existed —
+defaulting it off would have been a silent behavior change nobody asked for.
+Flip the default in `CONFIG_SCHEMA` if that's ever wrong for a fresh install.
+When it's off, or the `speedtest_bin` binary can't be found, the Connection
+tab **stays visible** rather than disappearing — it was tempting to hide it,
+but the tab is also the one place a user finds the "why is this off, and how
+do I turn it on" explanation (`#speed-disabled-notice` /
+`#speed-binary-missing-notice`, driven by `GET /speed/status`). A hidden tab
+can't show that. Keep this in mind before "cleaning up" the UI by hiding
+inactive tabs — discoverability of the fix matters more than decluttering
+here.
 
 ## Known constraints and gotchas
 

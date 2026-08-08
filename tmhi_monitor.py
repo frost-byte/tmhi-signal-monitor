@@ -15,7 +15,8 @@ Design note (the whole point of v0):
 
 Requirements: Python 3.8+  (standard library only). A browser for the dashboard.
 Also polls upload/download/ping/jitter via the Ookla Speedtest CLI (a separate
-binary, shelled out to -- see SPEEDTEST_BIN below). Missing/failing binary
+binary, shelled out to -- see CONFIG_SCHEMA["speedtest_bin"] below; toggle the
+whole feature with CONFIG_SCHEMA["speedtest_enabled"]). Missing/failing binary
 degrades to ok=0 rows, same as an unreachable gateway; it never crashes the app.
 Run:          python3 tmhi_monitor.py
 Then open:    http://localhost:8073
@@ -80,6 +81,14 @@ CONFIG_SCHEMA = {
         "restart_required": True,
         "validate": lambda v: 1 <= v <= 65535,
     },
+    "speedtest_enabled": {
+        "type": "bool", "default": True,
+        "label": "Enable Speed Testing",
+        "help": "Turn periodic and manual download/upload/ping/jitter tests on or off. Takes effect "
+                "on the next scheduled cycle; manual 'Run test now' is refused while off.",
+        "restart_required": False,
+        "validate": lambda v: isinstance(v, bool),
+    },
     "speedtest_bin": {
         "type": "str", "default": os.path.expanduser("~/.local/bin/speedtest"),
         "label": "Speedtest Binary Path",
@@ -103,7 +112,15 @@ CONFIG_SCHEMA = {
         "validate": lambda v: v >= 5,
     },
 }
-_TYPE_CASTERS = {"str": str, "int": int}
+
+def _cast_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+_TYPE_CASTERS = {"str": str, "int": int, "bool": _cast_bool}
 
 def config_schema_public():
     """CONFIG_SCHEMA without the non-serializable validate() lambdas, for the web UI."""
@@ -457,8 +474,14 @@ def run_one_speedtest(conn):
 
 def speedtest_loop(conn, stop_event):
     while not stop_event.is_set():
-        run_one_speedtest(conn)
+        if CFG.get("speedtest_enabled"):
+            run_one_speedtest(conn)
         stop_event.wait(CFG.get("speedtest_interval"))
+
+def speedtest_binary_status():
+    """Is the configured speedtest binary actually present and executable?"""
+    path = CFG.get("speedtest_bin")
+    return os.path.isfile(path) and os.access(path, os.X_OK)
 
 # ----------------------------------------------------------------------------
 # WEB DASHBOARD  -  served inline; talks only to this server (no CORS issues).
@@ -523,6 +546,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .config-input{width:100%;max-width:420px;background:var(--ink);border:1px solid var(--line);
     border-radius:6px;color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 10px}
   .config-input:focus{outline:none;border-color:var(--cyan)}
+  .notice{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:16px 18px;margin-bottom:20px}
+  .notice.hidden{display:none}
+  .notice-title{font-size:13px;font-weight:600;color:var(--text);margin-bottom:8px}
+  .notice p{font-size:12.5px;line-height:1.6;color:var(--dim);margin:0 0 10px}
+  .notice code{background:var(--ink);border:1px solid var(--line);border-radius:4px;
+    padding:1px 5px;color:var(--text)}
+  .notice pre{background:var(--ink);border:1px solid var(--line);border-radius:6px;
+    padding:10px 12px;font-size:11.5px;line-height:1.5;overflow-x:auto;margin:0 0 10px;color:var(--text)}
+  #speed-active.hidden{display:none}
   .lab{display:flex;align-items:center;gap:5px}
   [data-tip]{position:relative}
   [data-tip]:hover::after,[data-tip]:focus-within::after{
@@ -636,34 +669,54 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </section>
 
   <section class="tab-panel hidden" id="panel-speed">
-    <div class="readouts">
-      <div class="cell bw" data-tip="How fast data can be pulled from the internet">
-        <div class="lab">Download<button class="info-btn" data-metric="download" aria-label="About Download">i</button></div>
-        <div class="val" id="v-dl">–<span class="unit">Mbps</span></div>
-      </div>
-      <div class="cell bw" data-tip="How fast data can be sent to the internet">
-        <div class="lab">Upload<button class="info-btn" data-metric="upload" aria-label="About Upload">i</button></div>
-        <div class="val" id="v-ul">–<span class="unit">Mbps</span></div>
-      </div>
-      <div class="cell lat" data-tip="Round-trip time to the test server">
-        <div class="lab">Ping<button class="info-btn" data-metric="ping" aria-label="About Ping">i</button></div>
-        <div class="val" id="v-ping">–<span class="unit">ms</span></div>
-      </div>
-      <div class="cell lat" data-tip="How much the ping time varies between samples">
-        <div class="lab">Jitter<button class="info-btn" data-metric="jitter" aria-label="About Jitter">i</button></div>
-        <div class="val" id="v-jitter">–<span class="unit">ms</span></div>
-      </div>
+    <div class="notice hidden" id="speed-disabled-notice">
+      <div class="notice-title">Speed testing is disabled</div>
+      <p>Periodic and manual download/upload/ping/jitter tests are turned off. Signal monitoring
+      on the other tab is unaffected.</p>
+      <button class="btn" id="speed-enable-btn">Enable in Configuration</button>
     </div>
-    <div class="server-line" id="speed-server">no speed test data yet</div>
 
-    <div class="chartbox">
-      <div class="chart-tools">
-        <span><span class="swatch" style="background:#a78bfa"></span>bandwidth axis (Mbps) — Download, Upload</span>
-        <span><span class="swatch" style="background:#f472b6"></span>latency axis (ms) — Ping, Jitter</span>
-        <button class="btn" id="speed-run-btn" style="margin-left:auto">Run test now</button>
-        <span class="meta" id="speed-run-status"></span>
+    <div class="notice hidden" id="speed-binary-missing-notice">
+      <div class="notice-title">Speedtest binary not found</div>
+      <p>Speed testing is enabled, but no executable was found at
+      <code id="speed-binary-path"></code>. Install the Ookla Speedtest CLI (no root needed):</p>
+      <pre>curl -sL -o /tmp/speedtest.tgz https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz
+tar -xzf /tmp/speedtest.tgz -C ~/.local/bin speedtest
+chmod +x ~/.local/bin/speedtest</pre>
+      <p>Or point <strong>Speedtest Binary Path</strong> at wherever it's already installed.</p>
+      <button class="btn" id="speed-fix-path-btn">Go to Configuration</button>
+    </div>
+
+    <div id="speed-active">
+      <div class="readouts">
+        <div class="cell bw" data-tip="How fast data can be pulled from the internet">
+          <div class="lab">Download<button class="info-btn" data-metric="download" aria-label="About Download">i</button></div>
+          <div class="val" id="v-dl">–<span class="unit">Mbps</span></div>
+        </div>
+        <div class="cell bw" data-tip="How fast data can be sent to the internet">
+          <div class="lab">Upload<button class="info-btn" data-metric="upload" aria-label="About Upload">i</button></div>
+          <div class="val" id="v-ul">–<span class="unit">Mbps</span></div>
+        </div>
+        <div class="cell lat" data-tip="Round-trip time to the test server">
+          <div class="lab">Ping<button class="info-btn" data-metric="ping" aria-label="About Ping">i</button></div>
+          <div class="val" id="v-ping">–<span class="unit">ms</span></div>
+        </div>
+        <div class="cell lat" data-tip="How much the ping time varies between samples">
+          <div class="lab">Jitter<button class="info-btn" data-metric="jitter" aria-label="About Jitter">i</button></div>
+          <div class="val" id="v-jitter">–<span class="unit">ms</span></div>
+        </div>
       </div>
-      <div class="chart-wrap"><canvas id="chart-speed"></canvas></div>
+      <div class="server-line" id="speed-server">no speed test data yet</div>
+
+      <div class="chartbox">
+        <div class="chart-tools">
+          <span><span class="swatch" style="background:#a78bfa"></span>bandwidth axis (Mbps) — Download, Upload</span>
+          <span><span class="swatch" style="background:#f472b6"></span>latency axis (ms) — Ping, Jitter</span>
+          <button class="btn" id="speed-run-btn" style="margin-left:auto">Run test now</button>
+          <span class="meta" id="speed-run-status"></span>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-speed"></canvas></div>
+      </div>
     </div>
   </section>
 
@@ -701,6 +754,7 @@ document.querySelectorAll('.tab-btn').forEach(btn=>{
     document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('hidden', p.id !== 'panel-'+btn.dataset.tab));
   });
 });
+document.querySelector('.tab-btn[data-tab="speed"]').addEventListener('click', checkSpeedStatus);
 
 function sinrColor(v){ if(v==null) return "var(--dim)"; if(v>=13) return "var(--good)"; if(v>=5) return "var(--warn)"; return "var(--bad)"; }
 function rsrpColor(v){ if(v==null) return "var(--dim)"; if(v>=-90) return "var(--good)"; if(v>=-105) return "var(--warn)"; return "var(--bad)"; }
@@ -786,6 +840,28 @@ document.getElementById('speed-run-btn').addEventListener('click', async ()=>{
     btn.disabled = false;
   }
 });
+
+function goToConfigTab(){
+  document.querySelector('.tab-btn[data-tab="config"]').click();
+}
+document.getElementById('speed-enable-btn').addEventListener('click', goToConfigTab);
+document.getElementById('speed-fix-path-btn').addEventListener('click', goToConfigTab);
+
+async function checkSpeedStatus(){
+  const disabledNotice = document.getElementById('speed-disabled-notice');
+  const missingNotice = document.getElementById('speed-binary-missing-notice');
+  const active = document.getElementById('speed-active');
+  try{
+    const res = await fetch('/speed/status');
+    const s = await res.json();
+    disabledNotice.classList.toggle('hidden', s.enabled);
+    missingNotice.classList.toggle('hidden', !s.enabled || s.binary_found);
+    active.classList.toggle('hidden', !s.enabled || !s.binary_found);
+    if(!s.binary_found){
+      document.getElementById('speed-binary-path').textContent = s.binary_path;
+    }
+  }catch(e){ /* leave last-known state on screen */ }
+}
 
 function setCell(id,val,unit){
   const el=document.getElementById(id);
@@ -1002,11 +1078,19 @@ async function loadConfig(){
       const unit = schema.unit ? ' ('+escapeHtml(schema.unit)+')' : '';
       const row = document.createElement('div');
       row.className = 'config-row';
-      row.innerHTML =
-        '<label class="config-label" for="cfg-'+key+'">'+escapeHtml(schema.label)+unit+restartTag+'</label>'
-        + '<div class="config-hint">'+escapeHtml(schema.help)+'</div>'
-        + '<input class="config-input" id="cfg-'+key+'" type="'+(schema.type==='int'?'number':'text')+'" '
-        + 'value="'+escapeHtml(val)+'" data-key="'+key+'">';
+      let input;
+      if(schema.type === 'bool'){
+        input = '<label class="config-label" style="display:flex;align-items:center;gap:8px;cursor:pointer">'
+          + '<input class="config-input" type="checkbox" id="cfg-'+key+'" data-key="'+key+'" '+(val?'checked':'')+'> '
+          + escapeHtml(schema.label)+unit+restartTag+'</label>';
+        row.innerHTML = input + '<div class="config-hint">'+escapeHtml(schema.help)+'</div>';
+      }else{
+        input = '<input class="config-input" id="cfg-'+key+'" type="'+(schema.type==='int'?'number':'text')+'" '
+          + 'value="'+escapeHtml(val)+'" data-key="'+key+'">';
+        row.innerHTML =
+          '<label class="config-label" for="cfg-'+key+'">'+escapeHtml(schema.label)+unit+restartTag+'</label>'
+          + '<div class="config-hint">'+escapeHtml(schema.help)+'</div>' + input;
+      }
       form.appendChild(row);
     }
     document.getElementById('config-dbpath').textContent =
@@ -1020,7 +1104,9 @@ document.getElementById('config-save-btn').addEventListener('click', async ()=>{
   const status = document.getElementById('config-status');
   const payload = {};
   document.querySelectorAll('.config-input').forEach(input=>{
-    payload[input.dataset.key] = input.type === 'number' ? Number(input.value) : input.value;
+    if(input.type === 'checkbox') payload[input.dataset.key] = input.checked;
+    else if(input.type === 'number') payload[input.dataset.key] = Number(input.value);
+    else payload[input.dataset.key] = input.value;
   });
   status.textContent = 'saving…';
   try{
@@ -1085,6 +1171,7 @@ document.querySelector('.tab-btn[data-tab="config"]').addEventListener('click', 
 })();
 
 loadConfig();
+checkSpeedStatus();
 </script>
 </body>
 </html>
@@ -1120,11 +1207,20 @@ class Handler(BaseHTTPRequestHandler):
             rows = db_rows_since(self.server.conn, since)
             self._send(200, json.dumps(rows).encode("utf-8"), "application/json")
         elif self.path.startswith("/speed/run"):
-            if _speedtest_lock.locked():
+            if not CFG.get("speedtest_enabled"):
+                body = {"started": False, "reason": "speed testing is disabled in Configuration"}
+            elif _speedtest_lock.locked():
                 body = {"started": False, "reason": "a speed test is already running"}
             else:
                 threading.Thread(target=run_one_speedtest, args=(self.server.conn,), daemon=True).start()
                 body = {"started": True}
+            self._send(200, json.dumps(body).encode("utf-8"), "application/json")
+        elif self.path.startswith("/speed/status"):
+            body = {
+                "enabled": CFG.get("speedtest_enabled"),
+                "binary_path": CFG.get("speedtest_bin"),
+                "binary_found": speedtest_binary_status(),
+            }
             self._send(200, json.dumps(body).encode("utf-8"), "application/json")
         elif self.path.startswith("/speed"):
             since = 0.0
