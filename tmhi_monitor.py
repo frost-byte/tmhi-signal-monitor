@@ -221,10 +221,51 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .cell.power .val{color:var(--amber)}
   .cell.quality .val{color:var(--cyan)}
   .cell.small .val{font-size:15px;font-weight:500;color:var(--text)}
+  .lab{display:flex;align-items:center;gap:5px}
+  [data-tip]{position:relative}
+  [data-tip]:hover::after,[data-tip]:focus-within::after{
+    content:attr(data-tip);position:absolute;left:0;bottom:100%;margin-bottom:8px;
+    background:#1c2530;color:var(--text);border:1px solid var(--line);
+    padding:6px 9px;border-radius:6px;font-size:11px;line-height:1.35;
+    width:max-content;max-width:220px;z-index:20;box-shadow:0 4px 12px rgba(0,0,0,.45);
+    pointer-events:none;text-transform:none;letter-spacing:normal;font-weight:400}
+  .info-btn{display:inline-flex;align-items:center;justify-content:center;
+    width:14px;height:14px;border-radius:50%;border:1px solid var(--dim);color:var(--dim);
+    background:transparent;font:italic 10px Georgia,serif;line-height:1;cursor:pointer;padding:0}
+  .info-btn:hover,.info-btn:focus{border-color:var(--cyan);color:var(--cyan);outline:none}
+  .info-btn.active{border-color:var(--cyan);color:var(--cyan);background:rgba(56,189,248,.15)}
+  .bars-icon{display:flex;align-items:flex-end;gap:3px;height:24px;margin-top:2px}
+  .bars-icon .bar{width:6px;border-radius:2px 2px 0 0;background:var(--line)}
+  .bars-icon .bar.on{background:var(--good)}
+  .bars-icon .bar:nth-child(1){height:40%}
+  .bars-icon .bar:nth-child(2){height:55%}
+  .bars-icon .bar:nth-child(3){height:70%}
+  .bars-icon .bar:nth-child(4){height:85%}
+  .bars-icon .bar:nth-child(5){height:100%}
+  .bars-num{font-size:11px;color:var(--dim);margin-top:4px}
   .chartbox{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px}
   .chart-tools{display:flex;gap:16px;align-items:center;margin-bottom:8px;flex-wrap:wrap;font-size:12px;color:var(--dim)}
   .chart-tools label{cursor:pointer;user-select:none}
-  canvas{width:100%!important}
+  .chart-wrap{position:relative;height:320px}
+  canvas{width:100%!important;height:100%!important}
+  .detail-panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:14px 16px;margin-top:14px}
+  .detail-panel.hidden{display:none}
+  .detail-head{display:flex;justify-content:space-between;align-items:center;gap:12px;
+    font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--text);
+    border-bottom:1px solid var(--line);padding-bottom:8px;margin-bottom:10px}
+  #detail-close{background:none;border:none;color:var(--dim);font-size:18px;
+    cursor:pointer;line-height:1;padding:0 4px}
+  #detail-close:hover{color:var(--text)}
+  .detail-body{font-size:12.5px;line-height:1.6}
+  .detail-body p{margin:0 0 10px}
+  .detail-body code{background:var(--ink);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+  .range-table{border-collapse:collapse;font-size:12px;margin-top:4px}
+  .range-table td{padding:3px 10px 3px 0;white-space:nowrap}
+  .range-table td.tag{font-weight:600;border-radius:4px;padding:1px 8px;color:#0d1117;text-align:center}
+  .range-table td.tag.good{background:var(--good)}
+  .range-table td.tag.warn{background:var(--warn)}
+  .range-table td.tag.bad{background:var(--bad)}
   footer{color:var(--dim);font-size:11px;text-align:center;padding:16px}
   .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
 </style>
@@ -238,14 +279,41 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="wrap">
   <div class="readouts">
-    <div class="cell quality"><div class="lab">SINR</div><div class="val" id="v-sinr">–<span class="unit">dB</span></div></div>
-    <div class="cell power"><div class="lab">RSRP</div><div class="val" id="v-rsrp">–<span class="unit">dBm</span></div></div>
-    <div class="cell quality"><div class="lab">RSRQ</div><div class="val" id="v-rsrq">–<span class="unit">dB</span></div></div>
-    <div class="cell power"><div class="lab">RSSI</div><div class="val" id="v-rssi">–<span class="unit">dBm</span></div></div>
-    <div class="cell small"><div class="lab">Band</div><div class="val" id="v-band">–</div></div>
-    <div class="cell small"><div class="lab">Bars</div><div class="val" id="v-bars">–</div></div>
-    <div class="cell small"><div class="lab">Antenna</div><div class="val" id="v-ant">–</div></div>
-    <div class="cell small"><div class="lab">State</div><div class="val" id="v-conn">–</div></div>
+    <div class="cell quality" data-tip="Signal-to-noise ratio — the single best overall quality indicator">
+      <div class="lab">SINR<button class="info-btn" data-metric="sinr" aria-label="About SINR">i</button></div>
+      <div class="val" id="v-sinr">–<span class="unit">dB</span></div>
+    </div>
+    <div class="cell power" data-tip="Signal power — reflects raw coverage strength">
+      <div class="lab">RSRP<button class="info-btn" data-metric="rsrp" aria-label="About RSRP">i</button></div>
+      <div class="val" id="v-rsrp">–<span class="unit">dBm</span></div>
+    </div>
+    <div class="cell quality" data-tip="Signal quality, accounting for interference from other cells">
+      <div class="lab">RSRQ<button class="info-btn" data-metric="rsrq" aria-label="About RSRQ">i</button></div>
+      <div class="val" id="v-rsrq">–<span class="unit">dB</span></div>
+    </div>
+    <div class="cell power" data-tip="Total received power — signal plus interference plus noise">
+      <div class="lab">RSSI<button class="info-btn" data-metric="rssi" aria-label="About RSSI">i</button></div>
+      <div class="val" id="v-rssi">–<span class="unit">dBm</span></div>
+    </div>
+    <div class="cell small" data-tip="Active 5G frequency band(s), e.g. n71">
+      <div class="lab">Band<button class="info-btn" data-metric="band" aria-label="About Band">i</button></div>
+      <div class="val" id="v-band">–</div>
+    </div>
+    <div class="cell small" data-tip="Coarse indicator based on RSRP only — ignores SINR">
+      <div class="lab">Bars<button class="info-btn" data-metric="bars" aria-label="About Bars">i</button></div>
+      <div class="bars-icon" id="v-bars-icon" aria-hidden="true">
+        <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+      </div>
+      <div class="bars-num" id="v-bars-num">–</div>
+    </div>
+    <div class="cell small" data-tip="Which antenna the gateway is currently using">
+      <div class="lab">Antenna<button class="info-btn" data-metric="antenna" aria-label="About Antenna">i</button></div>
+      <div class="val" id="v-ant">–</div>
+    </div>
+    <div class="cell small" data-tip="Gateway's registration status on the network">
+      <div class="lab">State<button class="info-btn" data-metric="conn" aria-label="About connection state">i</button></div>
+      <div class="val" id="v-conn">–</div>
+    </div>
   </div>
 
   <div class="chartbox">
@@ -254,7 +322,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span><span class="swatch" style="background:#f5a524"></span>power axis (dBm) — RSRP, RSSI</span>
       <label style="margin-left:auto"><input type="checkbox" id="tgl-power" checked> show power</label>
     </div>
-    <canvas id="chart" height="320"></canvas>
+    <div class="chart-wrap"><canvas id="chart"></canvas></div>
+  </div>
+
+  <div class="detail-panel hidden" id="detail-panel">
+    <div class="detail-head">
+      <span id="detail-title">—</span>
+      <button id="detail-close" aria-label="Close details">×</button>
+    </div>
+    <div class="detail-body" id="detail-body"></div>
   </div>
 </div>
 
@@ -309,6 +385,91 @@ function setCell(id,val,unit){
   else{ el.innerHTML=val+(unit?'<span class="unit">'+unit+'</span>':''); }
 }
 
+function renderBars(value){
+  const n = value==null ? 0 : Math.round(value);
+  document.querySelectorAll('#v-bars-icon .bar').forEach((bar,i)=>{
+    bar.classList.toggle('on', (i+1)<=n);
+  });
+  document.getElementById('v-bars-num').textContent = value==null ? '–' : (Math.round(value)+'/5');
+}
+
+function rangeTable(rows){
+  return '<table class="range-table">'+rows.map(r=>
+    '<tr><td class="tag '+r[2]+'">'+r[0]+'</td><td>'+r[1]+'</td></tr>').join('')+'</table>';
+}
+
+const METRIC_INFO = {
+  sinr: {
+    title: 'SINR — Signal-to-Interference-plus-Noise Ratio',
+    body: '<p>Measures how strong the usable signal is relative to interference and background '
+        + 'noise, in dB. This is the single best predictor of real-world throughput and stability '
+        + '— more telling than bars, and more telling than RSRP alone.</p>'
+        + rangeTable([['Good','≥ 13 dB','good'],['Fair','5 – 13 dB','warn'],['Poor','&lt; 5 dB','bad']])
+  },
+  rsrp: {
+    title: 'RSRP — Reference Signal Received Power',
+    body: '<p>The power level of the reference signal, in dBm. Reflects raw coverage — how strong '
+        + 'the signal is at your location — independent of interference.</p>'
+        + rangeTable([['Good','≥ -90 dBm','good'],['Fair','-90 to -105 dBm','warn'],['Poor','≤ -105 dBm','bad']])
+  },
+  rsrq: {
+    title: 'RSRQ — Reference Signal Received Quality',
+    body: '<p>Signal quality in dB, factoring in interference from other cells sharing the same '
+        + 'channel resources. Complements RSRP by capturing congestion/interference RSRP alone misses.</p>'
+        + rangeTable([['Good','≥ -12 dB','good'],['Fair','-12 to -16 dB','warn'],['Poor','≤ -16 dB','bad']])
+  },
+  rssi: {
+    title: 'RSSI — Received Signal Strength Indicator',
+    body: '<p>Total received power in dBm across the whole channel — signal plus interference plus '
+        + "noise combined. Because it isn't isolated to just the reference signal, it's the least "
+        + 'specific of the four metrics; read it alongside RSRP/SINR rather than on its own.</p>'
+  },
+  band: {
+    title: 'Band',
+    body: '<p>The active 5G NR frequency band, e.g. <code>n71</code>. Lower-numbered "low bands" '
+        + '(like n71, ~600 MHz) travel farther and penetrate walls well, but carry less capacity. '
+        + '"Mid bands" (like n41, ~2.5 GHz) trade some range and penetration for significantly '
+        + 'higher throughput. If a location shows only a low band, an external directional antenna '
+        + 'often helps most by improving RSRP/SINR on that band, or by unlocking a mid-band signal '
+        + "that's otherwise too weak to hold.</p>"
+  },
+  bars: {
+    title: 'Bars',
+    body: '<p>A coarse 0–5 indicator derived mainly from RSRP. It <strong>ignores SINR</strong>, so '
+        + "it's possible to see full bars while quality is actually poor due to interference or "
+        + 'noise. Treat bars as a rough at-a-glance signal only — SINR and RSRP are the metrics '
+        + 'that matter.</p>'
+  },
+  antenna: {
+    title: 'Antenna',
+    body: "<p><strong>Internal</strong> — using the gateway's built-in antenna. "
+        + '<strong>External</strong> — using an attached directional/panel antenna, typically aimed '
+        + 'at a specific tower to improve signal.</p>'
+  },
+  conn: {
+    title: 'Connection State',
+    body: "<p>The gateway's registration status on the T-Mobile network — normally "
+        + '<code>registered</code>. Anything else, or the status dot going red, indicates the '
+        + 'gateway has lost its connection.</p>'
+  }
+};
+
+document.querySelectorAll('.info-btn').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    const info = METRIC_INFO[btn.dataset.metric];
+    if(!info) return;
+    document.getElementById('detail-title').textContent = info.title;
+    document.getElementById('detail-body').innerHTML = info.body;
+    document.getElementById('detail-panel').classList.remove('hidden');
+    document.querySelectorAll('.info-btn').forEach(b=>b.classList.toggle('active', b===btn));
+    document.getElementById('detail-panel').scrollIntoView({behavior:'smooth', block:'nearest'});
+  });
+});
+document.getElementById('detail-close').addEventListener('click', ()=>{
+  document.getElementById('detail-panel').classList.add('hidden');
+  document.querySelectorAll('.info-btn').forEach(b=>b.classList.remove('active'));
+});
+
 async function tick(){
   try{
     const res = await fetch('/data?since='+lastTs);
@@ -338,7 +499,7 @@ async function tick(){
       setCell('v-rsrq', last.rsrq, 'dB');
       setCell('v-rssi', last.rssi, 'dBm');
       setCell('v-band', last.band);
-      setCell('v-bars', last.bars);
+      renderBars(last.bars);
       setCell('v-ant',  last.antenna);
       setCell('v-conn', last.connection);
       document.getElementById('v-sinr').style.color=sinrColor(last.sinr);
