@@ -304,6 +304,12 @@ def _dig(d, *path, default=None):
             return default
     return cur
 
+def _bytes_to_mbps(b):
+    return round(b * 8 / 1_000_000, 2) if isinstance(b, (int, float)) else None
+
+def _round1(v):
+    return round(v, 1) if isinstance(v, (int, float)) else None
+
 def poll_gateway():
     """
     Returns a normalized reading dict (always includes 'ok' and 'raw_json').
@@ -385,7 +391,25 @@ def poller_loop(conn, stop_event):
 # always stored in raw_json, and failures (missing binary, no network, timeout)
 # produce a normal ok=0 row instead of raising.
 # ----------------------------------------------------------------------------
+_progress_lock = threading.Lock()
+_progress = {"active": False}
+
+def _set_progress(**kv):
+    with _progress_lock:
+        _progress.update(kv)
+
+def get_speedtest_progress():
+    with _progress_lock:
+        return dict(_progress)
+
 def run_speedtest():
+    """
+    Same normalize/never-raise/raw_json contract as before, but now runs the
+    CLI via Popen instead of subprocess.run so it can stream progress into
+    _progress as the test runs (--progress=yes emits "ping"/"download"/
+    "upload" lines with live bandwidth + a 0-1 "progress" fraction, not just
+    the final "result" line). Frontend polls GET /speed/progress for this.
+    """
     now = time.time()
     iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     base = {
@@ -395,31 +419,64 @@ def run_speedtest():
         "raw_json": None,
     }
 
+    _set_progress(active=True, phase="starting", server=None,
+                   download_mbps=None, upload_mbps=None, ping_ms=None, jitter_ms=None,
+                   ping_progress=0, download_progress=0, upload_progress=0)
+
     try:
-        proc = subprocess.run(
-            [CFG.get("speedtest_bin"), "--accept-license", "--accept-gdpr", "-f", "json"],
-            capture_output=True, text=True, timeout=CFG.get("speedtest_timeout"),
+        proc = subprocess.Popen(
+            [CFG.get("speedtest_bin"), "--accept-license", "--accept-gdpr",
+             "-f", "json", "--progress=yes", "--progress-update-interval=250"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
         )
     except Exception as e:
+        _set_progress(active=False)
         base["raw_json"] = json.dumps({"_exec_error": str(e)})
         return base
 
-    stdout = proc.stdout or ""
-    base["raw_json"] = stdout + (proc.stderr or "")
+    # Hard timeout: kill the process if it's still running after this. Using
+    # a Timer (not subprocess.run's built-in timeout) because we're streaming
+    # lines as they arrive rather than waiting for the process to finish.
+    timer = threading.Timer(CFG.get("speedtest_timeout"), proc.kill)
+    timer.start()
 
-    # The CLI prints one JSON object per line (progress/log lines, then a
-    # final line with "type":"result"). Only the result line matters here.
+    lines = []
     result = None
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        if obj.get("type") == "result":
-            result = obj
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+
+            t = obj.get("type")
+            if t == "testStart":
+                _set_progress(phase="ping", server=_dig(obj, "server", default=None))
+            elif t == "ping":
+                p = _dig(obj, "ping", default={}) or {}
+                _set_progress(phase="ping", ping_ms=_round1(p.get("latency")),
+                              jitter_ms=_round1(p.get("jitter")),
+                              ping_progress=p.get("progress", 0))
+            elif t == "download":
+                d = _dig(obj, "download", default={}) or {}
+                _set_progress(phase="download", download_mbps=_bytes_to_mbps(d.get("bandwidth")),
+                              download_progress=d.get("progress", 0))
+            elif t == "upload":
+                u = _dig(obj, "upload", default={}) or {}
+                _set_progress(phase="upload", upload_mbps=_bytes_to_mbps(u.get("bandwidth")),
+                              upload_progress=u.get("progress", 0))
+            elif t == "result":
+                result = obj
+        proc.wait()
+    finally:
+        timer.cancel()
+        _set_progress(active=False, phase="done")
+
+    base["raw_json"] = "".join(lines)
 
     if result is None:
         return base
@@ -429,18 +486,12 @@ def run_speedtest():
     ping   = _dig(result, "ping", default={}) or {}
     server = _dig(result, "server", default={}) or {}
 
-    def bytes_to_mbps(b):
-        return round(b * 8 / 1_000_000, 2) if isinstance(b, (int, float)) else None
-
-    def round1(v):
-        return round(v, 1) if isinstance(v, (int, float)) else None
-
     base.update({
         "ok": 1,
-        "download_mbps": bytes_to_mbps(dl.get("bandwidth")),
-        "upload_mbps": bytes_to_mbps(ul.get("bandwidth")),
-        "ping_ms": round1(ping.get("latency")),
-        "jitter_ms": round1(ping.get("jitter")),
+        "download_mbps": _bytes_to_mbps(dl.get("bandwidth")),
+        "upload_mbps": _bytes_to_mbps(ul.get("bandwidth")),
+        "ping_ms": _round1(ping.get("latency")),
+        "jitter_ms": _round1(ping.get("jitter")),
         "packet_loss": result.get("packetLoss"),
         "server_name": server.get("name"),
         "server_location": server.get("location"),
@@ -556,6 +607,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .notice pre{background:var(--ink);border:1px solid var(--line);border-radius:6px;
     padding:10px 12px;font-size:11.5px;line-height:1.5;overflow-x:auto;margin:0 0 10px;color:var(--text)}
   #speed-active.hidden{display:none}
+  .progress-wrap{margin:-8px 0 18px}
+  .progress-wrap.hidden{display:none}
+  .progress-label{font-size:11px;color:var(--dim);margin-bottom:5px;
+    text-transform:uppercase;letter-spacing:.08em}
+  .progress-track{height:6px;background:var(--ink);border:1px solid var(--line);
+    border-radius:4px;overflow:hidden}
+  .progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--violet),var(--rose));
+    transition:width .25s linear}
   .lab{display:flex;align-items:center;gap:5px}
   [data-tip]{position:relative}
   [data-tip]:hover::after,[data-tip]:focus-within::after{
@@ -705,6 +764,10 @@ chmod +x ~/.local/bin/speedtest</pre>
           <div class="lab">Jitter<button class="info-btn" data-metric="jitter" aria-label="About Jitter">i</button></div>
           <div class="val" id="v-jitter">–<span class="unit">ms</span></div>
         </div>
+      </div>
+      <div class="progress-wrap hidden" id="speed-progress">
+        <div class="progress-label" id="speed-progress-label">testing…</div>
+        <div class="progress-track"><div class="progress-fill" id="speed-progress-fill"></div></div>
       </div>
       <div class="server-line" id="speed-server">no speed test data yet</div>
 
@@ -1062,6 +1125,61 @@ async function tickSpeed(){
   }catch(e){ /* signal tick() already surfaces a dashboard-offline state */ }
 }
 
+let lastProgressActive = false;
+
+async function tickProgress(){
+  const wrap = document.getElementById('speed-progress');
+  try{
+    const res = await fetch('/speed/progress');
+    const p = await res.json();
+    const wasActive = lastProgressActive;
+    lastProgressActive = p.active;
+    wrap.classList.toggle('hidden', !p.active);
+
+    if(!p.active){
+      if(wasActive){
+        // test just finished -- pull the final stored row now instead of
+        // waiting for tickSpeed()'s next 5s cycle
+        tickSpeed();
+        if(pendingSpeedTest){
+          pendingSpeedTest = false;
+          document.getElementById('speed-run-btn').disabled = false;
+          document.getElementById('speed-run-status').textContent = 'done';
+        }
+      }
+      return;
+    }
+
+    const label = document.getElementById('speed-progress-label');
+    const fill = document.getElementById('speed-progress-fill');
+    let pct = 0, text = 'starting…';
+
+    if(p.phase === 'ping'){
+      pct = (p.ping_progress||0) * 100;
+      text = 'measuring ping / jitter…';
+      if(p.ping_ms!=null) setCell('v-ping', p.ping_ms, 'ms');
+      if(p.jitter_ms!=null) setCell('v-jitter', p.jitter_ms, 'ms');
+    }else if(p.phase === 'download'){
+      pct = (p.download_progress||0) * 100;
+      text = 'testing download' + (p.download_mbps!=null ? '… '+p.download_mbps+' Mbps' : '…');
+      if(p.download_mbps!=null) setCell('v-dl', p.download_mbps, 'Mbps');
+    }else if(p.phase === 'upload'){
+      pct = (p.upload_progress||0) * 100;
+      text = 'testing upload' + (p.upload_mbps!=null ? '… '+p.upload_mbps+' Mbps' : '…');
+      if(p.upload_mbps!=null) setCell('v-ul', p.upload_mbps, 'Mbps');
+    }
+    label.textContent = text;
+    fill.style.width = Math.min(100, Math.max(0, pct)) + '%';
+
+    if(p.server && p.server.name){
+      document.getElementById('speed-server').textContent =
+        'testing against ' + p.server.name + (p.server.location ? (' · '+p.server.location) : '');
+    }
+  }catch(e){
+    wrap.classList.add('hidden');
+  }
+}
+
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -1172,6 +1290,8 @@ document.querySelector('.tab-btn[data-tab="config"]').addEventListener('click', 
 
 loadConfig();
 checkSpeedStatus();
+tickProgress();
+setInterval(tickProgress, 500);
 </script>
 </body>
 </html>
@@ -1222,6 +1342,8 @@ class Handler(BaseHTTPRequestHandler):
                 "binary_found": speedtest_binary_status(),
             }
             self._send(200, json.dumps(body).encode("utf-8"), "application/json")
+        elif self.path.startswith("/speed/progress"):
+            self._send(200, json.dumps(get_speedtest_progress()).encode("utf-8"), "application/json")
         elif self.path.startswith("/speed"):
             since = 0.0
             if "since=" in self.path:

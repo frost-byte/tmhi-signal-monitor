@@ -151,9 +151,27 @@ For both:
   `/data?since=<ts>` and `/speed?since=<ts>` (JSON rows newer than a unix
   timestamp; client polls incrementally and tracks `lastTs`/`lastSpeedTs`),
   `/speed/run` (fire-and-forget trigger for an immediate speed test — refused
-  with `{"started": false}` if disabled or already running), and
+  with `{"started": false}` if disabled or already running),
   `/speed/status` (`{"enabled", "binary_path", "binary_found"}` — drives the
-  Connection tab's state, see below).
+  Connection tab's state, see below), and `/speed/progress` (live in-flight
+  test state, see below).
+- **Live speed test progress**: `run_speedtest()` runs the CLI via
+  `subprocess.Popen` (not `subprocess.run`) with `--progress=yes
+  --progress-update-interval=250`, so it streams `ping`/`download`/`upload`
+  lines with a live bandwidth figure and a 0-1 `progress` fraction *before*
+  the final `"type":"result"` line — not just one shot at the end. Each line
+  updates the module-global `_progress` dict (guarded by `_progress_lock`,
+  read via `get_speedtest_progress()`), which `/speed/progress` serves as-is.
+  The timeout is enforced with a `threading.Timer(...).cancel()`-guarded
+  `proc.kill()` rather than `subprocess.run`'s built-in timeout, since we're
+  reading lines as they arrive instead of blocking for the whole run. The
+  frontend's `tickProgress()` polls this every 500ms (independent of the 5s
+  `tick()`/`tickSpeed()` cadence — progress needs to feel live) and drives
+  both the progress bar and, during the run, the Download/Upload/Ping/Jitter
+  cells directly; when it sees `active` flip back to `false` it immediately
+  calls `tickSpeed()` rather than waiting for that function's own next cycle,
+  so the final stored row (and the "Run test now" button re-enabling) lands
+  within ~500ms instead of up to 5s.
 - **Dashboard**: three tabs, switched client-side (`.tab-btn` / `.tab-panel`,
   no reload). **Signal** tab: cyan = dB quality metrics, amber = dBm power
   metrics, dual-axis Chart.js line chart; SINR/RSRP readouts color-coded

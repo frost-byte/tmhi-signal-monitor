@@ -101,9 +101,12 @@ Three tabs, no page reloads:
   hover tooltip and an "i" icon that opens a plain-language explanation of
   what the metric means and what a healthy value looks like.
 - **Connection** — download/upload/ping/jitter, its own history chart, and a
-  "Run test now" button for an on-demand test outside the schedule. If speed
-  testing is turned off, or the CLI binary isn't installed, this tab explains
-  why and how to fix it instead of showing empty charts.
+  "Run test now" button for an on-demand test outside the schedule. While a
+  test is running (scheduled or manual), a live progress bar tracks its
+  current phase (ping → download → upload) with the in-progress number
+  updating in real time, not just the final result. If speed testing is
+  turned off, or the CLI binary isn't installed, this tab explains why and
+  how to fix it instead of showing empty charts.
 - **Configuration** — every setting below, editable from the browser. Most
   changes apply on the next poll/test cycle with no restart; a couple
   (listening address/port) are flagged as needing one.
