@@ -34,6 +34,42 @@ To see every startup flag:
 python3 tmhi_monitor.py --help
 ```
 
+## Running as a service (auto-restart, starts on boot)
+
+`tmhi-monitor.service` in this repo is a systemd **user** unit — no root
+required. Edit its `WorkingDirectory`/`ExecStart` paths if your checkout
+lives somewhere other than this directory, then:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp tmhi-monitor.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now tmhi-monitor.service
+
+# Optional but recommended: start at boot even without an active login
+# session (otherwise the service only starts once you log in).
+loginctl enable-linger "$USER"
+```
+
+Useful commands:
+
+```bash
+systemctl --user status tmhi-monitor.service    # is it running?
+journalctl --user -u tmhi-monitor.service -f    # follow its logs
+systemctl --user restart tmhi-monitor.service   # e.g. after an http_port/http_host config change
+systemctl --user disable --now tmhi-monitor.service   # stop managing it
+```
+
+`Restart=on-failure` in the unit means systemd brings it back if the process
+crashes; it does *not* restart it just because you edited a setting in the
+Configuration tab — most settings already apply live, and the couple that
+don't (listening host/port) tell you a restart is needed when you save them.
+
+If you'd rather run it as a proper system-wide service (starts independent
+of any user account, the traditional choice for a server) instead of a user
+service, that needs a unit under `/etc/systemd/system/` and `sudo`, which
+this README won't walk through since it depends on your system's sudo setup.
+
 ## Speed testing (optional)
 
 Signal monitoring works out of the box with no extra installs. The

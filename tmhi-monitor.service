@@ -1,0 +1,14 @@
+[Unit]
+Description=TMHI Signal Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/beerye/projects/tmobile_monitor
+ExecStart=/usr/bin/python3 /home/beerye/projects/tmobile_monitor/tmhi_monitor.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

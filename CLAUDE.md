@@ -243,6 +243,24 @@ can't show that. Keep this in mind before "cleaning up" the UI by hiding
 inactive tabs — discoverability of the fix matters more than decluttering
 here.
 
+## Deployment
+
+`tmhi-monitor.service` (repo root) is a systemd **user** unit — deliberately
+not a system-wide `/etc/systemd/system/` unit, because installing one of
+those needs `sudo`, and this environment's `sudo` has no working TTY for a
+password prompt (discovered while setting this up — any root-requiring step
+has to be handed to the human to run in a real terminal, not executed here).
+The user-unit path needs no root at all: `systemctl --user enable --now`,
+plus `loginctl enable-linger "$USER"` so it survives reboot without an active
+login session. Full install steps are in `README.md`. If `WorkingDirectory`
+or `ExecStart` in the unit ever drift from the actual checkout path, fix both
+the repo copy and `~/.config/systemd/user/tmhi-monitor.service` — they're not
+symlinked, just copied.
+
+`Restart=on-failure` recovers crashes; it is not a substitute for the live
+config-reload behavior described above, and doesn't fire just because a
+setting changed.
+
 ## Known constraints and gotchas
 
 - **Firmware drift is expected.** T-Mobile has changed these endpoints across
