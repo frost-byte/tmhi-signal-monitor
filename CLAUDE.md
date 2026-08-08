@@ -204,10 +204,12 @@ read-only in the UI.
 **Live reload**: `poll_gateway()`, `run_speedtest()`, and the two background
 loops call `CFG.get(...)` on every cycle rather than caching a value, so
 changes saved via the Configuration tab apply on the *next* poll/test cycle
-with no restart. The one exception is `http_port` — the HTTP server socket is
-already bound at startup, so changing it is flagged `restart_required` in
-both `CONFIG_SCHEMA` and the `POST /config` response, and only takes effect
-after you restart the script.
+with no restart. The exceptions are `http_host` and `http_port` — the HTTP
+server socket is already bound at startup, so changing either is flagged
+`restart_required` in both `CONFIG_SCHEMA` and the `POST /config` response,
+and only takes effect after you restart the script. `http_host` defaults to
+`0.0.0.0` (all interfaces, reachable from other devices on the LAN); set it
+to `127.0.0.1` to restrict the dashboard to this machine only.
 
 **Validation**: `Config.set()` casts via `type` and rejects via `validate`
 (e.g. `poll_seconds >= 1`, `1 <= http_port <= 65535`) before writing to the

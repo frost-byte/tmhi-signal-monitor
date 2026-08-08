@@ -65,6 +65,14 @@ CONFIG_SCHEMA = {
         "restart_required": False,
         "validate": lambda v: v >= 1,
     },
+    "http_host": {
+        "type": "str", "default": "0.0.0.0",
+        "label": "Dashboard HTTP Host",
+        "help": "Address the web dashboard listens on. '0.0.0.0' = all interfaces (reachable from "
+                "other devices on the network); '127.0.0.1' = this machine only.",
+        "restart_required": True,
+        "validate": lambda v: isinstance(v, str) and len(v) > 0,
+    },
     "http_port": {
         "type": "int", "default": 8073,
         "label": "Dashboard HTTP Port",
@@ -1198,7 +1206,7 @@ def main():
     speedtester = threading.Thread(target=speedtest_loop, args=(conn, stop_event), daemon=True)
     speedtester.start()
 
-    server = ThreadingHTTPServer(("0.0.0.0", CFG.get("http_port")), Handler)
+    server = ThreadingHTTPServer((CFG.get("http_host"), CFG.get("http_port")), Handler)
     server.conn = conn
 
     print(f"TMHI Signal Monitor running.")
@@ -1206,6 +1214,7 @@ def main():
     print(f"  Poll      : every {CFG.get('poll_seconds')}s")
     print(f"  Speedtest : every {CFG.get('speedtest_interval')}s via {CFG.get('speedtest_bin')}")
     print(f"  Storage   : {RESOLVED_DB_PATH}")
+    print(f"  Listening : {CFG.get('http_host')}:{CFG.get('http_port')}")
     print(f"  Dashboard : http://localhost:{CFG.get('http_port')}   (Ctrl-C to stop)")
     try:
         server.serve_forever()
