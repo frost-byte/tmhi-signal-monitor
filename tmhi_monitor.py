@@ -22,6 +22,7 @@ Then open:    http://localhost:8073
 Stop:         Ctrl-C
 """
 
+import argparse
 import json
 import os
 import sqlite3
@@ -33,25 +34,80 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ----------------------------------------------------------------------------
-# CONFIG  -  the only things you're likely to change
+# CONFIG  -  one schema drives CLI flags, the `config` DB table, and the web
+# UI's Configuration tab. Add a setting here and all three pick it up.
+#
+# Precedence (lowest to highest): "default" below  <  persisted `config` table
+# (what the web UI edits, survives restarts)  <  CLI flag for this run only
+# (never written back to the table -- a one-off --poll-seconds doesn't become
+# permanent). db_path is the one exception: it has to be known before the DB
+# can be opened, so it's CLI-only and never lives in the table.
 # ----------------------------------------------------------------------------
-GATEWAY_URL   = "http://192.168.12.1/TMI/v1/gateway?get=signal"
-POLL_SECONDS  = 5          # how often to poll the gateway
-HTTP_PORT     = 8073       # dashboard served at http://localhost:<PORT>
-DB_PATH       = "tmhi_signal.db"
-FETCH_TIMEOUT = 8          # seconds before a gateway request gives up
+CONFIG_SCHEMA = {
+    "gateway_url": {
+        "type": "str", "default": "http://192.168.12.1/TMI/v1/gateway?get=signal",
+        "label": "Gateway URL",
+        "help": "T-Mobile gateway signal endpoint to poll.",
+        "restart_required": False,
+        "validate": lambda v: isinstance(v, str) and v.startswith("http"),
+    },
+    "poll_seconds": {
+        "type": "int", "default": 5, "unit": "s",
+        "label": "Signal Poll Interval",
+        "help": "How often to poll the gateway for signal readings. Takes effect on the next poll cycle.",
+        "restart_required": False,
+        "validate": lambda v: v >= 1,
+    },
+    "fetch_timeout": {
+        "type": "int", "default": 8, "unit": "s",
+        "label": "Gateway Fetch Timeout",
+        "help": "How long to wait for the gateway to respond before giving up on a poll.",
+        "restart_required": False,
+        "validate": lambda v: v >= 1,
+    },
+    "http_port": {
+        "type": "int", "default": 8073,
+        "label": "Dashboard HTTP Port",
+        "help": "Port the web dashboard listens on.",
+        "restart_required": True,
+        "validate": lambda v: 1 <= v <= 65535,
+    },
+    "speedtest_bin": {
+        "type": "str", "default": os.path.expanduser("~/.local/bin/speedtest"),
+        "label": "Speedtest Binary Path",
+        "help": "Path to the Ookla Speedtest CLI executable.",
+        "restart_required": False,
+        "validate": lambda v: isinstance(v, str) and len(v) > 0,
+    },
+    "speedtest_interval": {
+        "type": "int", "default": 900, "unit": "s",
+        "label": "Speed Test Interval",
+        "help": "How often to run a full download/upload/ping/jitter test. Each run saturates the "
+                "link for 15-30s, so don't set this too low. Takes effect on the next cycle.",
+        "restart_required": False,
+        "validate": lambda v: v >= 30,
+    },
+    "speedtest_timeout": {
+        "type": "int", "default": 90, "unit": "s",
+        "label": "Speed Test Timeout",
+        "help": "How long to wait for a speed test to finish before treating it as failed.",
+        "restart_required": False,
+        "validate": lambda v: v >= 5,
+    },
+}
+_TYPE_CASTERS = {"str": str, "int": int}
 
-SPEEDTEST_BIN      = os.path.expanduser("~/.local/bin/speedtest")  # Ookla CLI
-SPEEDTEST_INTERVAL = 900   # seconds between full speed tests (15 min)
-SPEEDTEST_TIMEOUT  = 90    # seconds before giving up on a speed test
+def config_schema_public():
+    """CONFIG_SCHEMA without the non-serializable validate() lambdas, for the web UI."""
+    return {k: {kk: vv for kk, vv in s.items() if kk != "validate"} for k, s in CONFIG_SCHEMA.items()}
 
 # ----------------------------------------------------------------------------
 # STORAGE
 # ----------------------------------------------------------------------------
-def db_connect():
-    # check_same_thread=False: poller thread + HTTP threads share the file.
+def db_connect(db_path):
+    # check_same_thread=False: background threads + HTTP threads share the file.
     # Writes are serialized behind _db_lock below.
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -97,6 +153,13 @@ def db_init(conn):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_speed_ts ON speedtest_history(ts)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL   -- JSON-encoded scalar, so ints/strings round-trip cleanly
+        )
+    """)
     conn.commit()
 
 def db_insert(conn, row):
@@ -140,6 +203,66 @@ def db_speed_rows_since(conn, since_ts):
         )
         return [dict(r) for r in cur.fetchall()]
 
+def db_config_load(conn):
+    with _db_lock:
+        cur = conn.execute("SELECT key, value FROM config")
+        rows = cur.fetchall()
+    return {r["key"]: json.loads(r["value"]) for r in rows}
+
+def db_config_set(conn, key, value):
+    with _db_lock:
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value)),
+        )
+        conn.commit()
+
+class Config:
+    """Thread-safe live settings: defaults, overlaid with whatever's persisted
+    in the `config` table, overlaid with this run's CLI flags (not persisted).
+    poller_loop()/speedtest_loop()/poll_gateway()/run_speedtest() read through
+    this on every cycle, so web-UI edits apply without a restart."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._lock = threading.Lock()
+        self._values = {k: s["default"] for k, s in CONFIG_SCHEMA.items()}
+        persisted = db_config_load(conn)
+        self._values.update({k: v for k, v in persisted.items() if k in CONFIG_SCHEMA})
+
+    def get(self, key):
+        with self._lock:
+            return self._values[key]
+
+    def as_dict(self):
+        with self._lock:
+            return dict(self._values)
+
+    def set(self, key, raw_value):
+        if key not in CONFIG_SCHEMA:
+            raise KeyError(f"unknown setting: {key}")
+        schema = CONFIG_SCHEMA[key]
+        value = _TYPE_CASTERS[schema["type"]](raw_value)
+        validator = schema.get("validate")
+        if validator and not validator(value):
+            raise ValueError(f"invalid value for {key}: {raw_value!r}")
+        with self._lock:
+            self._values[key] = value
+        db_config_set(self._conn, key, value)
+        return value
+
+    def apply_cli_overrides(self, overrides):
+        """overrides: {key: value or None}. None means "not passed on the CLI".
+        Intentionally NOT persisted -- applies to this process only."""
+        with self._lock:
+            for k, v in overrides.items():
+                if v is not None:
+                    self._values[k] = v
+
+CFG = None            # set in main(); a module global like the old constants were
+RESOLVED_DB_PATH = None  # for display only -- db_path itself is never in Config
+
 # ----------------------------------------------------------------------------
 # THE FRAGILE BOUNDARY  -  the only T-Mobile-schema-aware code in the app.
 # If a firmware update changes field names or nesting, fix it HERE and nowhere
@@ -172,8 +295,8 @@ def poll_gateway():
     }
 
     try:
-        req = urllib.request.Request(GATEWAY_URL, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        req = urllib.request.Request(CFG.get("gateway_url"), headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=CFG.get("fetch_timeout")) as resp:
             raw_text = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         base["raw_json"] = json.dumps({"_fetch_error": str(e)})
@@ -229,7 +352,7 @@ def poller_loop(conn, stop_event):
                   f"rsrq={reading['rsrq']}  sinr={reading['sinr']}  bars={reading['bars']}")
         except Exception as e:
             print(f"[poller] insert failed: {e}")
-        stop_event.wait(POLL_SECONDS)
+        stop_event.wait(CFG.get("poll_seconds"))
 
 # ----------------------------------------------------------------------------
 # SPEED TEST  -  the only Ookla-CLI-schema-aware code in the app. Same rule as
@@ -249,8 +372,8 @@ def run_speedtest():
 
     try:
         proc = subprocess.run(
-            [SPEEDTEST_BIN, "--accept-license", "--accept-gdpr", "-f", "json"],
-            capture_output=True, text=True, timeout=SPEEDTEST_TIMEOUT,
+            [CFG.get("speedtest_bin"), "--accept-license", "--accept-gdpr", "-f", "json"],
+            capture_output=True, text=True, timeout=CFG.get("speedtest_timeout"),
         )
     except Exception as e:
         base["raw_json"] = json.dumps({"_exec_error": str(e)})
@@ -327,7 +450,7 @@ def run_one_speedtest(conn):
 def speedtest_loop(conn, stop_event):
     while not stop_event.is_set():
         run_one_speedtest(conn)
-        stop_event.wait(SPEEDTEST_INTERVAL)
+        stop_event.wait(CFG.get("speedtest_interval"))
 
 # ----------------------------------------------------------------------------
 # WEB DASHBOARD  -  served inline; talks only to this server (no CORS issues).
@@ -385,6 +508,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     border-radius:6px;padding:5px 12px;font-family:var(--mono);font-size:12px;cursor:pointer}
   .btn:hover{border-color:var(--cyan)}
   .btn:disabled{opacity:.5;cursor:default}
+  .config-row{margin-bottom:16px}
+  .config-label{display:block;font-size:12px;font-weight:600;color:var(--text);margin-bottom:3px}
+  .config-label .restart-tag{font-weight:400;color:var(--warn);text-transform:none;letter-spacing:normal}
+  .config-hint{font-size:11.5px;color:var(--dim);margin-bottom:6px;line-height:1.4}
+  .config-input{width:100%;max-width:420px;background:var(--ink);border:1px solid var(--line);
+    border-radius:6px;color:var(--text);font-family:var(--mono);font-size:13px;padding:7px 10px}
+  .config-input:focus{outline:none;border-color:var(--cyan)}
   .lab{display:flex;align-items:center;gap:5px}
   [data-tip]{position:relative}
   [data-tip]:hover::after,[data-tip]:focus-within::after{
@@ -445,6 +575,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="tabs">
     <button class="tab-btn active" data-tab="signal">Signal</button>
     <button class="tab-btn" data-tab="speed">Connection</button>
+    <button class="tab-btn" data-tab="config">Configuration</button>
   </div>
 
   <section class="tab-panel" id="panel-signal">
@@ -526,6 +657,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
       <div class="chart-wrap"><canvas id="chart-speed"></canvas></div>
     </div>
+  </section>
+
+  <section class="tab-panel hidden" id="panel-config">
+    <div class="chartbox" style="max-width:520px">
+      <div id="config-form"></div>
+      <div style="margin-top:4px;display:flex;align-items:center;gap:12px">
+        <button class="btn" id="config-save-btn">Save changes</button>
+        <span class="meta" id="config-status"></span>
+      </div>
+    </div>
+    <div class="server-line" id="config-dbpath" style="margin-top:14px"></div>
   </section>
 
   <div class="detail-panel hidden" id="detail-panel">
@@ -836,6 +978,66 @@ async function tickSpeed(){
   }catch(e){ /* signal tick() already surfaces a dashboard-offline state */ }
 }
 
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadConfig(){
+  try{
+    const res = await fetch('/config');
+    const data = await res.json();
+    const form = document.getElementById('config-form');
+    form.innerHTML = '';
+    for(const [key, schema] of Object.entries(data.schema)){
+      const val = data.values[key];
+      const restartTag = schema.restart_required ? ' <span class="restart-tag">(restart required)</span>' : '';
+      const unit = schema.unit ? ' ('+escapeHtml(schema.unit)+')' : '';
+      const row = document.createElement('div');
+      row.className = 'config-row';
+      row.innerHTML =
+        '<label class="config-label" for="cfg-'+key+'">'+escapeHtml(schema.label)+unit+restartTag+'</label>'
+        + '<div class="config-hint">'+escapeHtml(schema.help)+'</div>'
+        + '<input class="config-input" id="cfg-'+key+'" type="'+(schema.type==='int'?'number':'text')+'" '
+        + 'value="'+escapeHtml(val)+'" data-key="'+key+'">';
+      form.appendChild(row);
+    }
+    document.getElementById('config-dbpath').textContent =
+      'Database file: '+data.db_path+' (set with --db-path at startup, not editable here)';
+  }catch(e){
+    document.getElementById('config-status').textContent = 'failed to load configuration';
+  }
+}
+
+document.getElementById('config-save-btn').addEventListener('click', async ()=>{
+  const status = document.getElementById('config-status');
+  const payload = {};
+  document.querySelectorAll('.config-input').forEach(input=>{
+    payload[input.dataset.key] = input.type === 'number' ? Number(input.value) : input.value;
+  });
+  status.textContent = 'saving…';
+  try{
+    const res = await fetch('/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    const errKeys = Object.keys(data.errors || {});
+    if(errKeys.length){
+      status.textContent = 'errors — ' + errKeys.map(k=>k+': '+data.errors[k]).join('; ');
+    }else if(data.restart_required && data.restart_required.length){
+      status.textContent = 'saved — restart the script for: ' + data.restart_required.join(', ');
+    }else{
+      status.textContent = 'saved';
+    }
+    loadConfig();
+  }catch(e){
+    status.textContent = 'save failed';
+  }
+});
+
+document.querySelector('.tab-btn[data-tab="config"]').addEventListener('click', loadConfig);
+
 // On first load, pull recent history so the chart isn't empty.
 (async function bootstrap(){
   try{
@@ -873,6 +1075,8 @@ async function tickSpeed(){
   tickSpeed();
   setInterval(tickSpeed, POLL_MS);
 })();
+
+loadConfig();
 </script>
 </body>
 </html>
@@ -894,9 +1098,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/index"):
             html = (DASHBOARD_HTML
-                    .replace("POLL_MS_PLACEHOLDER", str(POLL_SECONDS * 1000))
-                    .replace("POLL_SECONDS_PLACEHOLDER", str(POLL_SECONDS))
-                    .replace("SPEEDTEST_INTERVAL_PLACEHOLDER", str(SPEEDTEST_INTERVAL)))
+                    .replace("POLL_MS_PLACEHOLDER", str(CFG.get("poll_seconds") * 1000))
+                    .replace("POLL_SECONDS_PLACEHOLDER", str(CFG.get("poll_seconds")))
+                    .replace("SPEEDTEST_INTERVAL_PLACEHOLDER", str(CFG.get("speedtest_interval"))))
             self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path.startswith("/data"):
             since = 0.0
@@ -923,12 +1127,70 @@ class Handler(BaseHTTPRequestHandler):
                     since = 0.0
             rows = db_speed_rows_since(self.server.conn, since)
             self._send(200, json.dumps(rows).encode("utf-8"), "application/json")
+        elif self.path.startswith("/config"):
+            body = {
+                "values": CFG.as_dict(),
+                "schema": config_schema_public(),
+                "db_path": RESOLVED_DB_PATH,
+            }
+            self._send(200, json.dumps(body).encode("utf-8"), "application/json")
         else:
             self._send(404, b"not found", "text/plain")
 
+    def do_POST(self):
+        if self.path.startswith("/config"):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                incoming = json.loads(raw or b"{}")
+            except Exception:
+                self._send(400, json.dumps({"error": "invalid JSON body"}).encode("utf-8"), "application/json")
+                return
+            if not isinstance(incoming, dict):
+                self._send(400, json.dumps({"error": "expected a JSON object"}).encode("utf-8"), "application/json")
+                return
+
+            updated, errors = {}, {}
+            for key, value in incoming.items():
+                try:
+                    updated[key] = CFG.set(key, value)
+                except Exception as e:
+                    errors[key] = str(e)
+
+            restart_required = sorted(k for k in updated if CONFIG_SCHEMA[k]["restart_required"])
+            body = {"updated": updated, "errors": errors, "restart_required": restart_required}
+            self._send(200, json.dumps(body).encode("utf-8"), "application/json")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+def parse_args():
+    p = argparse.ArgumentParser(description="TMHI Signal Monitor")
+    p.add_argument(
+        "--db-path", default="tmhi_signal.db",
+        help="SQLite file path (default: tmhi_signal.db). Has to be known before persisted config "
+             "can be loaded, so unlike everything else here, it's CLI-only -- not stored in the "
+             "config table, not editable from the web UI.",
+    )
+    for key, schema in CONFIG_SCHEMA.items():
+        flag = "--" + key.replace("_", "-")
+        caster = _TYPE_CASTERS[schema["type"]]
+        p.add_argument(
+            flag, type=caster, default=None,
+            help=f"Override '{schema['label']}' for this run only (not persisted; "
+                 f"current default: {schema['default']!r}). {schema['help']}",
+        )
+    return p.parse_args()
+
 def main():
-    conn = db_connect()
+    args = parse_args()
+
+    conn = db_connect(args.db_path)
     db_init(conn)
+
+    global CFG, RESOLVED_DB_PATH
+    RESOLVED_DB_PATH = args.db_path
+    CFG = Config(conn)
+    CFG.apply_cli_overrides({key: getattr(args, key) for key in CONFIG_SCHEMA})
 
     stop_event = threading.Event()
     poller = threading.Thread(target=poller_loop, args=(conn, stop_event), daemon=True)
@@ -936,15 +1198,15 @@ def main():
     speedtester = threading.Thread(target=speedtest_loop, args=(conn, stop_event), daemon=True)
     speedtester.start()
 
-    server = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", CFG.get("http_port")), Handler)
     server.conn = conn
 
     print(f"TMHI Signal Monitor running.")
-    print(f"  Gateway   : {GATEWAY_URL}")
-    print(f"  Poll      : every {POLL_SECONDS}s")
-    print(f"  Speedtest : every {SPEEDTEST_INTERVAL}s via {SPEEDTEST_BIN}")
-    print(f"  Storage   : {DB_PATH}")
-    print(f"  Dashboard : http://localhost:{HTTP_PORT}   (Ctrl-C to stop)")
+    print(f"  Gateway   : {CFG.get('gateway_url')}")
+    print(f"  Poll      : every {CFG.get('poll_seconds')}s")
+    print(f"  Speedtest : every {CFG.get('speedtest_interval')}s via {CFG.get('speedtest_bin')}")
+    print(f"  Storage   : {RESOLVED_DB_PATH}")
+    print(f"  Dashboard : http://localhost:{CFG.get('http_port')}   (Ctrl-C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -24,6 +24,7 @@ from a CDN.
 ```bash
 python3 tmhi_monitor.py
 # then open http://localhost:8073   (Ctrl-C to stop)
+python3 tmhi_monitor.py --help   # list startup flags (see Configuration below)
 ```
 
 No Python dependencies to install. Must run on a machine that can reach the
@@ -131,12 +132,12 @@ For both:
 
 ### Components
 
-- **Config block** (top of file): `GATEWAY_URL`, `POLL_SECONDS`, `HTTP_PORT`,
-  `DB_PATH`, `FETCH_TIMEOUT`, `SPEEDTEST_BIN`, `SPEEDTEST_INTERVAL`,
-  `SPEEDTEST_TIMEOUT`.
-- **SQLite storage**: tables `signal_history` and `speedtest_history`. Writes
-  serialized behind `_db_lock` because the background threads and HTTP threads
-  share one connection (`check_same_thread=False`).
+- **`CONFIG_SCHEMA`** (top of file): one dict drives CLI flags, the persisted
+  `config` table, and the web UI's Configuration tab. See "Configuration"
+  below — don't add a new setting in only one of those three places.
+- **SQLite storage**: tables `signal_history`, `speedtest_history`, and
+  `config`. Writes serialized behind `_db_lock` because the background threads
+  and HTTP threads share one connection (`check_same_thread=False`).
 - **Background poller thread**: calls `poll_gateway()` every `POLL_SECONDS`,
   inserts a row, prints a status line.
 - **Background speed test thread**: calls `run_speedtest()` every
@@ -149,7 +150,7 @@ For both:
   timestamp; client polls incrementally and tracks `lastTs`/`lastSpeedTs`),
   and `/speed/run` (fire-and-forget trigger for an immediate speed test,
   returns `{"started": false}` if one's already in flight).
-- **Dashboard**: two tabs, switched client-side (`.tab-btn` / `.tab-panel`,
+- **Dashboard**: three tabs, switched client-side (`.tab-btn` / `.tab-panel`,
   no reload). **Signal** tab: cyan = dB quality metrics, amber = dBm power
   metrics, dual-axis Chart.js line chart; SINR/RSRP readouts color-coded
   green/amber/red via `sinrColor`/`rsrpColor` (keep in sync with the
@@ -158,7 +159,9 @@ For both:
   Every readout has a hover tooltip (`data-tip`) and an info icon
   (`.info-btn`) that opens a shared details panel (`#detail-panel`); metric
   copy lives in the `METRIC_INFO` JS object — extend it there when adding
-  a new readout.
+  a new readout. **Configuration** tab: a form rendered entirely from
+  `GET /config`'s schema (`loadConfig()` in the HTML) — no hardcoded field
+  list on the frontend, so a new `CONFIG_SCHEMA` entry appears here for free.
 
 ### DB schema
 
@@ -168,6 +171,48 @@ For both:
 - **`speedtest_history`**: `id, ts (unix float), iso (UTC str), ok (0/1),
   download_mbps, upload_mbps, ping_ms, jitter_ms, packet_loss, server_name,
   server_location, isp, raw_json`
+- **`config`**: `key (TEXT PRIMARY KEY), value (TEXT, JSON-encoded scalar)` —
+  persisted overrides written by the web UI's Configuration tab.
+
+## Configuration
+
+Settings live in `CONFIG_SCHEMA` (top of file) — one dict per setting with
+`type`, `default`, `label`, `help`, `unit`, `restart_required`, and a
+`validate` function. That single schema generates three things, so adding a
+setting means editing `CONFIG_SCHEMA` once, not three places:
+
+1. **A CLI flag** (`--poll-seconds`, `--gateway-url`, etc. — `python3
+   tmhi_monitor.py --help` for the full list).
+2. **A row in the `config` SQLite table**, written whenever the web UI's
+   Configuration tab saves a change (`POST /config`), read back into memory
+   at startup and on every `Config.get()` call.
+3. **A field in the web UI's Configuration tab**, rendered client-side from
+   `GET /config`'s `schema` + `values` (`loadConfig()` in the dashboard JS) —
+   the label, help text, and unit shown there all come from `CONFIG_SCHEMA`.
+
+**Precedence** (lowest to highest): the `default` in `CONFIG_SCHEMA` → the
+persisted `config` table (what the web UI edits, survives restarts) → a CLI
+flag for that run (`Config.apply_cli_overrides()` — intentionally **not**
+written back to the table, so a one-off `--poll-seconds 2` doesn't silently
+become permanent).
+
+**`db_path`** is the one setting *not* in `CONFIG_SCHEMA` / the Configuration
+tab: it has to be known before the DB can even be opened to read persisted
+config, so it's CLI-only (`--db-path`, default `tmhi_signal.db`), shown
+read-only in the UI.
+
+**Live reload**: `poll_gateway()`, `run_speedtest()`, and the two background
+loops call `CFG.get(...)` on every cycle rather than caching a value, so
+changes saved via the Configuration tab apply on the *next* poll/test cycle
+with no restart. The one exception is `http_port` — the HTTP server socket is
+already bound at startup, so changing it is flagged `restart_required` in
+both `CONFIG_SCHEMA` and the `POST /config` response, and only takes effect
+after you restart the script.
+
+**Validation**: `Config.set()` casts via `type` and rejects via `validate`
+(e.g. `poll_seconds >= 1`, `1 <= http_port <= 65535`) before writing to the
+DB; `POST /config` reports failures per-field in `errors` rather than
+rejecting the whole request, so one bad field doesn't block the rest.
 
 ## Known constraints and gotchas
 
@@ -218,8 +263,6 @@ of the existing poll loop / SQLite store**; don't rearchitect to add them.
    the immediate need.)
 5. **Grafana/Prometheus feed** — expose a `/metrics` endpoint for external
    dashboards instead of / alongside the built-in one.
-6. **Config file or CLI args** — move the config block to `--flags` or a small
-   config file once more than a couple of knobs exist.
 
 ## Working preferences
 
