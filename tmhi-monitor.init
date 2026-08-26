@@ -1,0 +1,31 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt procd init script for TMHI Signal Monitor.
+# Install as /etc/init.d/tmhi-monitor (no extension), then:
+#   chmod +x /etc/init.d/tmhi-monitor
+#   /etc/init.d/tmhi-monitor enable
+#   /etc/init.d/tmhi-monitor start
+
+START=99
+STOP=10
+
+USE_PROCD=1
+
+PROG=/usr/bin/python3
+WORKDIR=/root/tmobile_monitor
+SCRIPT="$WORKDIR/tmhi_monitor.py"
+
+start_service() {
+	procd_open_instance
+	procd_set_param command "$PROG" "$SCRIPT"
+	procd_set_param cwd "$WORKDIR"
+	# procd instances don't inherit a login shell's env -- HOME must be set
+	# explicitly or tmhi_monitor.py's `~/.local/bin/speedtest` default
+	# (os.path.expanduser) resolves to a bare "/.local/bin/speedtest".
+	procd_set_param env HOME=/root
+	# respawn: threshold(s) timeout(s) retry(0=unlimited) -- mirrors the
+	# systemd unit's Restart=on-failure / RestartSec=5 with no retry cap.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
