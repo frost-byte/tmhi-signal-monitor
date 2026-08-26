@@ -70,6 +70,71 @@ of any user account, the traditional choice for a server) instead of a user
 service, that needs a unit under `/etc/systemd/system/` and `sudo`, which
 this README won't walk through since it depends on your system's sudo setup.
 
+## Running on OpenWrt (e.g. GL.iNet routers)
+
+OpenWrt uses `procd`, not systemd, so the section above doesn't apply there.
+`tmhi-monitor.init` in this repo is a procd init script for the same job.
+
+### Installing dependencies
+
+OpenWrt images are minimal, so install these via `opkg` over SSH on the
+router first:
+
+```sh
+opkg update
+opkg install python3 python3-light python3-sqlite3
+```
+
+`python3-sqlite3` is a separate package from `python3-light` on OpenWrt —
+without it the app fails at startup with a `sqlite3` import error.
+
+### Speed test CLI (optional)
+
+Same idea as [Speed testing](#speed-testing-optional) below, but match the
+router's **architecture**, not your desktop's — e.g. an ARM64 device like the
+GL.iNet Flint 2 needs the `linux-aarch64` build, not `linux-x86_64`:
+
+```sh
+uname -m   # confirm the router's architecture first
+mkdir -p ~/.local/bin
+curl -sL -o /tmp/speedtest.tgz https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz
+tar -xzf /tmp/speedtest.tgz -C ~/.local/bin speedtest
+chmod +x ~/.local/bin/speedtest
+~/.local/bin/speedtest --accept-license --accept-gdpr   # required once, or it hangs waiting for interactive consent
+```
+
+### Getting the files onto the router
+
+Many routers' SSH server (`dropbear`) has no SFTP subsystem, so plain `scp`
+may fail with `sftp-server: not found`. If so, pipe the files over a plain
+SSH connection instead:
+
+```sh
+ssh root@<router-ip> "mkdir -p /root/tmobile_monitor"
+ssh root@<router-ip> "cat > /root/tmobile_monitor/tmhi_monitor.py" < tmhi_monitor.py
+ssh root@<router-ip> "cat > /etc/init.d/tmhi-monitor" < tmhi-monitor.init
+ssh root@<router-ip> "chmod +x /etc/init.d/tmhi-monitor"
+```
+
+Edit `WORKDIR` at the top of `tmhi-monitor.init` first if you're not using
+`/root/tmobile_monitor`.
+
+### Managing the service
+
+```sh
+/etc/init.d/tmhi-monitor enable   # survives reboot
+/etc/init.d/tmhi-monitor start
+/etc/init.d/tmhi-monitor status
+/etc/init.d/tmhi-monitor stop
+logread -f                        # follow its logs (procd has no journalctl)
+```
+
+`tmhi-monitor.init` explicitly sets `HOME=/root` for the process — procd
+doesn't inherit a login shell's environment, so without it the
+`~/.local/bin/speedtest` default path (see [Configuration](#configuration))
+silently resolves to the wrong location, and the Connection tab reports the
+binary as missing even when it's installed.
+
 ## Speed testing (optional)
 
 Signal monitoring works out of the box with no extra installs. The
